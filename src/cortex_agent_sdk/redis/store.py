@@ -2,6 +2,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Self, cast
@@ -17,6 +18,13 @@ from cortex_agent_sdk.sessions.models import SessionRecord
 from cortex_agent_sdk.sessions.store import SessionLease
 
 type _RedisArgument = str | bytes | int | float
+
+
+@dataclass(frozen=True, slots=True)
+class _RedisKeys:
+    lease: str
+    record: str
+    fence: str
 
 
 class _RedisLease:
@@ -95,7 +103,10 @@ class RedisSessionStore:
         if not key_prefix or min(durations) <= 0:
             raise AppError(CodigoError.CONFIG_INVALIDA, "configuración de Redis inválida")
 
-        self._client = client or Redis.from_url(cast(str, url), decode_responses=False)
+        if client is None:
+            self._client = Redis.from_url(cast(str, url), decode_responses=False)
+        else:
+            self._client = client
         self._owns_client = client is None
         self._key_prefix = key_prefix.rstrip(":")
         self._ttl_milliseconds = _milliseconds(ttl_seconds)
@@ -138,9 +149,10 @@ class RedisSessionStore:
 
     async def reset(self, session_id: str, timeout_seconds: float = 5.0) -> None:
         async with self.acquire(session_id, timeout_seconds) as lease:
+            keys = self._keys(session_id)
             result = await self._eval(
                 scripts.RESET,
-                self._keys(session_id)[:2],
+                (keys.lease, keys.record),
                 self._lease_value(lease),
             )
             if int(cast(int, result)) != 1:
@@ -166,7 +178,7 @@ class RedisSessionStore:
         self._closed = True
 
     async def _acquire(self, session_id: str, owner: str, timeout_seconds: float) -> int:
-        lease_key, _, fence_key = self._keys(session_id)
+        keys = self._keys(session_id)
         deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
@@ -174,7 +186,7 @@ class RedisSessionStore:
                 raise AppError(CodigoError.SESION_OCUPADA, f"sesión ocupada: {session_id}")
             result = await self._eval(
                 scripts.ACQUIRE,
-                (lease_key, fence_key),
+                (keys.lease, keys.fence),
                 owner,
                 self._lease_milliseconds,
                 timeout_seconds=remaining,
@@ -188,16 +200,16 @@ class RedisSessionStore:
             await asyncio.sleep(min(self._retry_interval_seconds, remaining))
 
     async def _verify(self, session_id: str, lease_value: str) -> None:
-        lease_key, _, _ = self._keys(session_id)
-        result = await self._eval(scripts.VERIFY, (lease_key,), lease_value)
+        keys = self._keys(session_id)
+        result = await self._eval(scripts.VERIFY, (keys.lease,), lease_value)
         if int(cast(int, result)) != 1:
             raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
 
     async def _renew(self, session_id: str, lease_value: str) -> None:
-        lease_key, _, _ = self._keys(session_id)
+        keys = self._keys(session_id)
         result = await self._eval(
             scripts.RENEW,
-            (lease_key,),
+            (keys.lease,),
             lease_value,
             self._lease_milliseconds,
         )
@@ -205,10 +217,10 @@ class RedisSessionStore:
             raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
 
     async def _load(self, session_id: str, lease_value: str) -> SessionRecord | None:
-        lease_key, session_key, _ = self._keys(session_id)
+        keys = self._keys(session_id)
         raw = await self._eval(
             scripts.LOAD,
-            (lease_key, session_key),
+            (keys.lease, keys.record),
             lease_value,
             self._ttl_milliseconds,
         )
@@ -226,10 +238,10 @@ class RedisSessionStore:
                 "updated_at": datetime.now(UTC),
             }
         )
-        lease_key, session_key, _ = self._keys(record.session_id)
+        keys = self._keys(record.session_id)
         result = await self._eval(
             scripts.SAVE,
-            (lease_key, session_key),
+            (keys.lease, keys.record),
             lease_value,
             record.version,
             saved.version,
@@ -244,8 +256,8 @@ class RedisSessionStore:
         raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
 
     async def _release(self, session_id: str, lease_value: str) -> None:
-        lease_key, _, _ = self._keys(session_id)
-        await self._eval(scripts.RELEASE, (lease_key,), lease_value)
+        keys = self._keys(session_id)
+        await self._eval(scripts.RELEASE, (keys.lease,), lease_value)
 
     async def _eval(
         self,
@@ -270,10 +282,14 @@ class RedisSessionStore:
                 f"Redis lanzó {type(error).__name__}",
             ) from error
 
-    def _keys(self, session_id: str) -> tuple[str, str, str]:
+    def _keys(self, session_id: str) -> _RedisKeys:
         digest = sha256(session_id.encode()).hexdigest()
         base = f"{self._key_prefix}:{{{digest}}}"
-        return f"{base}:lease", f"{base}:record", f"{base}:fence"
+        return _RedisKeys(
+            lease=f"{base}:lease",
+            record=f"{base}:record",
+            fence=f"{base}:fence",
+        )
 
     def _lease_value(self, lease: SessionLease) -> str:
         if not isinstance(lease, _RedisLease):
@@ -290,4 +306,3 @@ def _milliseconds(seconds: float) -> int:
     if value < 1:
         raise AppError(CodigoError.CONFIG_INVALIDA, "duración Redis demasiado pequeña")
     return value
-

@@ -1,20 +1,27 @@
 import base64
 from collections.abc import Mapping
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from cortex_agent_sdk.immutable import (
-    FrozenJsonValue,
-    FrozenProviderValue,
-    freeze_json,
-    freeze_provider,
-    thaw_json,
+    JsonObject,
+    ProviderItem,
+    ProviderValue,
+    freeze_json_object,
+    freeze_provider_item,
+    thaw_json_object,
 )
 
 _BYTES_TAG = "$cortex.bytes"
-
-ProviderValue = FrozenProviderValue
 
 
 class ProviderState(BaseModel):
@@ -23,7 +30,7 @@ class ProviderState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     provider: str
-    items: tuple[Mapping[str, ProviderValue], ...]
+    items: tuple[ProviderItem, ...]
 
     @field_validator("items", mode="before")
     @classmethod
@@ -34,14 +41,14 @@ class ProviderState(BaseModel):
     @classmethod
     def freeze_items(
         cls,
-        value: tuple[Mapping[str, ProviderValue], ...],
-    ) -> tuple[Mapping[str, ProviderValue], ...]:
-        return tuple(_freeze_provider_item(item) for item in value)
+        value: tuple[ProviderItem, ...],
+    ) -> tuple[ProviderItem, ...]:
+        return tuple(freeze_provider_item(item) for item in value)
 
     @field_serializer("items", when_used="json")
     def encode_bytes(
         self,
-        items: tuple[Mapping[str, ProviderValue], ...],
+        items: tuple[ProviderItem, ...],
     ) -> tuple[dict[str, object], ...]:
         return tuple(
             {key: _encode_provider_bytes(value) for key, value in item.items()} for item in items
@@ -61,25 +68,22 @@ class ToolCallPart(BaseModel):
     type: Literal["tool_call"] = "tool_call"
     call_id: str
     name: str
-    arguments: Mapping[str, JsonValue]
+    arguments: JsonObject
 
     @field_validator("arguments", mode="after")
     @classmethod
     def freeze_arguments(
         cls,
-        value: Mapping[str, JsonValue],
-    ) -> Mapping[str, JsonValue]:
-        frozen = freeze_json(value)
-        if not isinstance(frozen, Mapping):
-            raise TypeError("arguments debe ser un objeto")
-        return cast(Mapping[str, JsonValue], frozen)
+        value: JsonObject,
+    ) -> JsonObject:
+        return freeze_json_object(value)
 
     @field_serializer("arguments", when_used="json")
     def serialize_arguments(
         self,
-        value: Mapping[str, JsonValue],
-    ) -> dict[str, object]:
-        return {key: thaw_json(cast(FrozenJsonValue, item)) for key, item in value.items()}
+        value: JsonObject,
+    ) -> dict[str, JsonValue]:
+        return thaw_json_object(value)
 
 
 class ToolResultPart(BaseModel):
@@ -93,7 +97,7 @@ class ToolResultPart(BaseModel):
     error_code: str | None = None
 
 
-Part = Annotated[TextPart | ToolCallPart | ToolResultPart, Field(discriminator="type")]
+HistoryPart = Annotated[TextPart | ToolCallPart | ToolResultPart, Field(discriminator="type")]
 
 
 class Turn(BaseModel):
@@ -102,8 +106,23 @@ class Turn(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     role: Literal["user", "assistant", "tool"]
-    parts: tuple[Part, ...]
+    parts: tuple[HistoryPart, ...]
     provider_state: ProviderState | None = None
+
+    @model_validator(mode="after")
+    def validate_role_contract(self) -> Self:
+        if self.role == "user":
+            valid_parts = all(isinstance(part, TextPart) for part in self.parts)
+        elif self.role == "assistant":
+            valid_parts = all(isinstance(part, TextPart | ToolCallPart) for part in self.parts)
+        else:
+            valid_parts = all(isinstance(part, ToolResultPart) for part in self.parts)
+
+        if not valid_parts:
+            raise ValueError(f"parts incompatibles con role={self.role}")
+        if self.role != "assistant" and self.provider_state is not None:
+            raise ValueError("provider_state requiere role=assistant")
+        return self
 
     @classmethod
     def user(cls, text: str) -> "Turn":
@@ -133,13 +152,3 @@ def _decode_provider_bytes(value: object) -> object:
     if set(value) == {_BYTES_TAG} and isinstance(value[_BYTES_TAG], str):
         return base64.b64decode(value[_BYTES_TAG], validate=True)
     return {key: _decode_provider_bytes(item) for key, item in value.items()}
-
-
-def _freeze_provider_item(
-    value: Mapping[str, ProviderValue],
-) -> Mapping[str, ProviderValue]:
-    frozen = freeze_provider(value)
-    if not isinstance(frozen, Mapping):
-        raise TypeError("provider item debe ser un objeto")
-    return frozen
-

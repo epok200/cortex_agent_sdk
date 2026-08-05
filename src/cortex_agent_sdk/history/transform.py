@@ -1,4 +1,4 @@
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -13,5 +13,4 @@ class TransformContext:
     session_id: str | None
 
 
-HistoryTransform = Callable[[TransformContext], Awaitable[tuple[Turn, ...] | list[Turn]]]
-
+HistoryTransform = Callable[[TransformContext], Awaitable[Sequence[Turn]]]

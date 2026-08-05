@@ -2,14 +2,14 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Annotated, Any, cast, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, JsonValue, create_model
 
 from cortex_agent_sdk.errores import AppError, CodigoError
-from cortex_agent_sdk.immutable import FrozenJsonValue, thaw_json
+from cortex_agent_sdk.immutable import thaw_json_object
 from cortex_agent_sdk.tools.models import Injected, ToolBinding, ToolFunction, ToolSpec
 
 
@@ -148,5 +148,4 @@ def _explicit_validator(
 
 
 def _plain_schema(spec: ToolSpec) -> dict[str, JsonValue]:
-    return {key: thaw_json(cast(FrozenJsonValue, value)) for key, value in spec.parameters.items()}
-
+    return thaw_json_object(spec.parameters)

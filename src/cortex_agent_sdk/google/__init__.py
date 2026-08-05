@@ -1,1 +1,1 @@
-"""Espacio reservado para el engine de Google posterior a 0.0.1."""
+"""Espacio reservado para el futuro engine de Google."""

@@ -43,7 +43,10 @@ class Agent:
         self._options = options or AgentOptions()
         self._history = HistoryPipeline(history_transform, self._options.max_history_turns)
         self._hooks = HookChain(hooks or AgentHooks(), self._options.hook_timeout_seconds)
-        self._session_store = session_store or MemorySessionStore()
+        if session_store is None:
+            self._session_store = MemorySessionStore()
+        else:
+            self._session_store = session_store
         self._own_engine = own_engine
         self._own_session_store = session_store is None or own_session_store
         self._lifecycle = AgentLifecycle()
@@ -65,7 +68,7 @@ class Agent:
         instructions: str | None = None,
     ) -> AgentResult:
         async with self._lifecycle.run():
-            if not text:
+            if not text.strip():
                 raise AppError(CodigoError.CONFIG_INVALIDA, "text no puede estar vacío")
 
             tool_set = ToolSet.build((*self._static_tools, *tuple(tools)))

@@ -11,24 +11,24 @@ from cortex_agent_sdk.engine import EngineRequest, EngineResult, ToolCall, Usage
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.gateway import OpenAICompatibleGateway
 from cortex_agent_sdk.history.models import (
+    HistoryPart,
     ProviderState,
-    ProviderValue,
     TextPart,
     ToolCallPart,
     ToolResultPart,
     Turn,
 )
 from cortex_agent_sdk.immutable import (
-    FrozenJsonValue,
-    FrozenProviderValue,
-    thaw_json,
-    thaw_provider,
+    ProviderItem,
+    thaw_json_object,
+    thaw_provider_item,
 )
+from cortex_agent_sdk.openai.models import OpenAIModels
 from cortex_agent_sdk.openai.options import OpenAIOptions
 from cortex_agent_sdk.tools.models import ToolSpec
 
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
-_PROVIDER_OBJECT = TypeAdapter(dict[str, ProviderValue])
+_PROVIDER_OBJECT = TypeAdapter(ProviderItem)
 
 
 class OpenAIEngine:
@@ -52,9 +52,13 @@ class OpenAIEngine:
 
         self._model = model
         self._options = options or OpenAIOptions()
-        self._client = client or self._create_client(api_key, gateway)
+        if client is None:
+            self._client = self._create_client(api_key, gateway)
+        else:
+            self._client = client
         self._owns_client = client is None
         self._closed = False
+        self._models = OpenAIModels(self._client, self._ensure_open)
 
     @property
     def provider(self) -> str:
@@ -64,17 +68,19 @@ class OpenAIEngine:
     def model(self) -> str:
         return self._model
 
+    @property
+    def models(self) -> OpenAIModels:
+        return self._models
+
     async def __aenter__(self) -> Self:
-        if self._closed:
-            raise AppError(CodigoError.RECURSO_CERRADO, "OpenAIEngine cerrado")
+        self._ensure_open()
         return self
 
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
     async def generate(self, request: EngineRequest) -> EngineResult:
-        if self._closed:
-            raise AppError(CodigoError.RECURSO_CERRADO, "OpenAIEngine cerrado")
+        self._ensure_open()
 
         payload = cast(dict[str, Any], self._build_payload(request))
         try:
@@ -129,6 +135,10 @@ class OpenAIEngine:
                     "OpenAIEngine no cerró su cliente dentro del timeout",
                 ) from error
         self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise AppError(CodigoError.RECURSO_CERRADO, "OpenAIEngine cerrado")
 
     def _create_client(
         self,
@@ -205,7 +215,7 @@ def _build_input(history: tuple[Turn, ...]) -> list[ResponseInputItemParam]:
                     "historial contiene estado de otro provider",
                 )
             items.extend(
-                cast(ResponseInputItemParam, thaw_provider(cast(FrozenProviderValue, item)))
+                cast(ResponseInputItemParam, thaw_provider_item(item))
                 for item in turn.provider_state.items
             )
             continue
@@ -226,9 +236,7 @@ def _build_input(history: tuple[Turn, ...]) -> list[ResponseInputItemParam]:
 
 
 def _tool_payload(spec: ToolSpec) -> dict[str, object]:
-    parameters = {
-        key: thaw_json(cast(FrozenJsonValue, value)) for key, value in spec.parameters.items()
-    }
+    parameters = thaw_json_object(spec.parameters)
     return {
         "type": "function",
         "name": spec.name,
@@ -255,8 +263,8 @@ def _parse_tool_calls(output: list[object]) -> tuple[ToolCall, ...]:
     return tuple(calls)
 
 
-def _build_parts(text: str, calls: tuple[ToolCall, ...]):
-    parts: list[TextPart | ToolCallPart] = []
+def _build_parts(text: str, calls: tuple[ToolCall, ...]) -> tuple[HistoryPart, ...]:
+    parts: list[HistoryPart] = []
     if text:
         parts.append(TextPart(text=text))
     parts.extend(

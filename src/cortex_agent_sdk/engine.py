@@ -1,12 +1,12 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, JsonValue, field_serializer, field_validator
 
 from cortex_agent_sdk.history.models import ToolCallPart, Turn
-from cortex_agent_sdk.immutable import FrozenJsonValue, freeze_json, thaw_json
+from cortex_agent_sdk.immutable import JsonObject, freeze_json_object, thaw_json_object
 from cortex_agent_sdk.tools.models import ToolSpec
 
 
@@ -15,25 +15,22 @@ class ToolCall(BaseModel):
 
     call_id: str
     name: str
-    arguments: Mapping[str, JsonValue]
+    arguments: JsonObject
 
     @field_validator("arguments", mode="after")
     @classmethod
     def freeze_arguments(
         cls,
-        value: Mapping[str, JsonValue],
-    ) -> Mapping[str, JsonValue]:
-        frozen = freeze_json(value)
-        if not isinstance(frozen, Mapping):
-            raise TypeError("arguments debe ser un objeto")
-        return cast(Mapping[str, JsonValue], frozen)
+        value: JsonObject,
+    ) -> JsonObject:
+        return freeze_json_object(value)
 
     @field_serializer("arguments", when_used="json")
     def serialize_arguments(
         self,
-        value: Mapping[str, JsonValue],
-    ) -> dict[str, object]:
-        return {key: thaw_json(cast(FrozenJsonValue, item)) for key, item in value.items()}
+        value: JsonObject,
+    ) -> dict[str, JsonValue]:
+        return thaw_json_object(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +114,7 @@ class EngineResult:
             isinstance(call, ToolCall) for call in self.tool_calls
         )
         valid_structured = self.structured is None or isinstance(self.structured, BaseModel)
-        if not isinstance(self.turn, Turn) or not valid_calls:
+        if not isinstance(self.turn, Turn) or self.turn.role != "assistant" or not valid_calls:
             raise TypeError("EngineResult inválido")
         turn_calls = tuple(part for part in self.turn.parts if isinstance(part, ToolCallPart))
         aligned_calls = len(turn_calls) == len(self.tool_calls) and all(
@@ -128,7 +125,15 @@ class EngineResult:
         )
         if not aligned_calls:
             raise TypeError("tool_calls no coincide con el turno")
-        if not isinstance(self.usage, Usage) or not self.provider or not self.model:
+        valid_identity = (
+            isinstance(self.provider, str)
+            and bool(self.provider)
+            and isinstance(self.model, str)
+            and bool(self.model)
+        )
+        provider_state = self.turn.provider_state
+        state_matches = provider_state is None or provider_state.provider == self.provider
+        if not isinstance(self.usage, Usage) or not valid_identity or not state_matches:
             raise TypeError("EngineResult inválido")
         if self.stop_reason is not None and not isinstance(self.stop_reason, str):
             raise TypeError("stop_reason inválido")
@@ -147,4 +152,3 @@ class ModelEngine(Protocol):
     async def generate(self, request: EngineRequest) -> EngineResult: ...
 
     async def aclose(self) -> None: ...
-

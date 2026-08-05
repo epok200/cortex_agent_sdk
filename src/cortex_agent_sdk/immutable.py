@@ -7,48 +7,69 @@ from pydantic import JsonValue
 type FrozenJsonValue = (
     bool | int | float | str | tuple[FrozenJsonValue, ...] | Mapping[str, FrozenJsonValue] | None
 )
-type FrozenProviderValue = (
+type JsonInputObject = Mapping[str, JsonValue]
+type FrozenJsonObject = Mapping[str, FrozenJsonValue]
+type JsonObject = JsonInputObject | FrozenJsonObject
+type ProviderValue = (
     bool
     | int
     | float
     | str
     | bytes
-    | tuple[FrozenProviderValue, ...]
-    | Mapping[str, FrozenProviderValue]
+    | tuple[ProviderValue, ...]
+    | Mapping[str, ProviderValue]
     | None
 )
+type ProviderItem = Mapping[str, ProviderValue]
 
 
-def freeze_json(value: JsonValue | Mapping[str, JsonValue]) -> FrozenJsonValue:
-    if isinstance(value, list):
-        return tuple(freeze_json(item) for item in value)
+def freeze_json_object(value: JsonObject) -> FrozenJsonObject:
+    frozen = {key: _freeze_json(item) for key, item in value.items()}
+    return MappingProxyType(frozen)
+
+
+def thaw_json_object(value: JsonObject) -> dict[str, JsonValue]:
+    return {key: _thaw_json(item) for key, item in value.items()}
+
+
+def freeze_provider_item(value: ProviderItem) -> ProviderItem:
+    frozen = {key: _freeze_provider(item) for key, item in value.items()}
+    return MappingProxyType(frozen)
+
+
+def thaw_provider_item(value: ProviderItem) -> dict[str, object]:
+    return {key: _thaw_provider(item) for key, item in value.items()}
+
+
+def _freeze_json(value: JsonValue | FrozenJsonValue) -> FrozenJsonValue:
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(item) for item in value)
     if isinstance(value, Mapping):
-        frozen = {key: freeze_json(item) for key, item in value.items()}
+        frozen = {key: _freeze_json(item) for key, item in value.items()}
         return MappingProxyType(frozen)
     return value
 
 
-def thaw_json(value: FrozenJsonValue) -> JsonValue:
-    if isinstance(value, tuple):
-        return [thaw_json(item) for item in value]
+def _thaw_json(value: JsonValue | FrozenJsonValue) -> JsonValue:
+    if isinstance(value, list | tuple):
+        return [_thaw_json(item) for item in value]
     if isinstance(value, Mapping):
-        return {key: thaw_json(item) for key, item in value.items()}
+        return {key: _thaw_json(item) for key, item in value.items()}
     return cast(JsonValue, value)
 
 
-def freeze_provider(value: FrozenProviderValue) -> FrozenProviderValue:
+def _freeze_provider(value: ProviderValue) -> ProviderValue:
     if isinstance(value, tuple):
-        return tuple(freeze_provider(item) for item in value)
+        return tuple(_freeze_provider(item) for item in value)
     if isinstance(value, Mapping):
-        frozen = {key: freeze_provider(item) for key, item in value.items()}
+        frozen = {key: _freeze_provider(item) for key, item in value.items()}
         return MappingProxyType(frozen)
     return value
 
 
-def thaw_provider(value: FrozenProviderValue) -> object:
+def _thaw_provider(value: ProviderValue) -> object:
     if isinstance(value, tuple):
-        return [thaw_provider(item) for item in value]
+        return [_thaw_provider(item) for item in value]
     if isinstance(value, Mapping):
-        return {key: thaw_provider(item) for key, item in value.items()}
+        return {key: _thaw_provider(item) for key, item in value.items()}
     return value
-

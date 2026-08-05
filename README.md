@@ -125,6 +125,7 @@ renovable, fencing token y compare-and-swap.
 Redis no requiere inicialización de schema:
 
 ```python
+import asyncio
 import os
 
 from cortex_agent_sdk import Agent
@@ -132,26 +133,38 @@ from cortex_agent_sdk.openai import OpenAIEngine
 from cortex_agent_sdk.redis import RedisSessionStore
 
 
-store = RedisSessionStore(os.environ["REDIS_URL"])
-agent = Agent(
-    OpenAIEngine("gpt-5.6-luna"),
-    session_store=store,
-    own_session_store=True,
-)
-result = await agent.run("Hola", session_id="producto:tenant:usuario")
-await agent.aclose()
+async def main() -> None:
+    store = RedisSessionStore(os.environ["REDIS_URL"])
+    async with Agent(
+        OpenAIEngine("gpt-5.6-luna"),
+        session_store=store,
+        own_session_store=True,
+    ) as agent:
+        result = await agent.run("Hola", session_id="producto:tenant:usuario")
+    print(result.text)
+
+
+asyncio.run(main())
 ```
 
 PostgreSQL exige crear su tabla de forma explícita una vez:
 
 ```python
+import asyncio
 import os
 
 from cortex_agent_sdk.postgres import PostgresSessionStore
 
 
-store = PostgresSessionStore(os.environ["POSTGRES_URL"])
-await store.setup()
+async def main() -> None:
+    store = PostgresSessionStore(os.environ["POSTGRES_URL"])
+    try:
+        await store.setup()
+    finally:
+        await store.aclose()
+
+
+asyncio.run(main())
 ```
 
 Una tarea periódica puede ejecutar `await store.cleanup_expired()` para vaciar historiales vencidos
@@ -159,8 +172,12 @@ que nunca volvieron a solicitarse. El row mínimo permanece para conservar el fe
 
 `Agent.aclose()` hace un cierre ordenado: deja de aceptar turnos nuevos, espera los turnos activos y
 después cierra los recursos que posee. El límite se configura con
-`AgentOptions.shutdown_timeout_seconds`. Si vence, el SDK no cancela el turno ni cierra conexiones;
-regresa `RUNTIME_CIERRE_TIMEOUT` para que la aplicación pueda reintentar el cierre.
+`AgentOptions.shutdown_timeout_seconds` y cubre tanto el drenado como el cierre físico. Si vence
+mientras hay un turno activo, el SDK no lo cancela ni empieza a cerrar recursos. Si vence durante el
+cierre físico, algunos recursos podrían haberse cerrado ya. El timeout es un presupuesto de cierre,
+no una garantía estricta de tiempo de pared: un finalizador que resista la cancelación puede retrasar
+el retorno para no abandonar recursos a medias. Al excederlo regresa `RUNTIME_CIERRE_TIMEOUT` y una
+segunda llamada a `aclose()` reintenta lo pendiente.
 
 Una sesión dañada o deliberadamente descartada se elimina mediante
 `await agent.reset_session(session_id)`.

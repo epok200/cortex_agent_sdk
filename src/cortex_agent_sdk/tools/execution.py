@@ -3,14 +3,13 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import cast
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from cortex_agent_sdk.engine import ToolCall
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import ToolResultPart
-from cortex_agent_sdk.immutable import FrozenJsonValue, thaw_json
+from cortex_agent_sdk.immutable import thaw_json_object
 from cortex_agent_sdk.tools.contracts import ToolDefinition, build_definition
 from cortex_agent_sdk.tools.models import ToolBinding, ToolFunction, ToolSpec
 
@@ -132,9 +131,7 @@ def _validate_arguments(
     definition: ToolDefinition,
     call: ToolCall,
 ) -> dict[str, object] | ToolOutcome:
-    public_input = {
-        key: thaw_json(cast(FrozenJsonValue, value)) for key, value in call.arguments.items()
-    }
+    public_input = thaw_json_object(call.arguments)
     if definition.schema_validator is not None:
         schema_error = next(definition.schema_validator.iter_errors(public_input), None)
         if schema_error is not None:
@@ -178,4 +175,3 @@ def _failed_outcome(
     payload = {"ok": False, "error": {"code": code.value, "message": message}}
     output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return ToolOutcome(call, output, True, is_final_answer, code.value)
-
