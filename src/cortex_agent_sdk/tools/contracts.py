@@ -2,7 +2,7 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Annotated, Any, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, cast, get_args, get_origin, get_type_hints
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, create_model
 
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.immutable import thaw_json_object
+from cortex_agent_sdk.tools.approval import ToolApprovalPredicate, ToolApprovalRule
 from cortex_agent_sdk.tools.models import (
     Injected,
     ToolBinding,
@@ -26,7 +27,7 @@ class ToolDefinition:
     input_model: type[BaseModel]
     private_arguments: Mapping[str, object]
     result_mode: ToolResultMode
-    needs_approval: bool
+    needs_approval: ToolApprovalRule
     schema_validator: Draft202012Validator | None
     input_parameter: str | None = None
 
@@ -102,18 +103,25 @@ def _declared_result_mode(binding: ToolBinding, function: ToolFunction) -> ToolR
     return ToolResultMode.CONTINUE
 
 
-def _declared_needs_approval(binding: ToolBinding, function: ToolFunction) -> bool:
+def _declared_needs_approval(
+    binding: ToolBinding,
+    function: ToolFunction,
+) -> ToolApprovalRule:
     if binding.needs_approval is not None:
-        if not isinstance(binding.needs_approval, bool):
-            raise AppError(CodigoError.CONFIG_INVALIDA, "needs_approval inválido")
-        return binding.needs_approval
+        return _validate_approval_rule(binding.needs_approval)
 
     decorated = getattr(binding.function, "__cortex_needs_approval__", None)
     if decorated is None:
         decorated = getattr(function, "__cortex_needs_approval__", False)
-    if not isinstance(decorated, bool):
-        raise AppError(CodigoError.CONFIG_INVALIDA, "needs_approval inválido")
-    return decorated
+    return _validate_approval_rule(decorated)
+
+
+def _validate_approval_rule(value: object) -> ToolApprovalRule:
+    if isinstance(value, bool):
+        return value
+    if callable(value):
+        return cast(ToolApprovalPredicate, value)
+    raise AppError(CodigoError.CONFIG_INVALIDA, "needs_approval inválido")
 
 
 def _declared_input_model(
