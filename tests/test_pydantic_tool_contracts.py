@@ -1,9 +1,10 @@
 import json
+from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Annotated, Self
+from typing import Annotated, Self, TypeIs
 
 import pytest
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from cortex_agent_sdk import final_answer, tool
 from cortex_agent_sdk.engine import ToolCall
@@ -38,18 +39,34 @@ async def confirm_reminder(args: ReminderArgs) -> str:
     return args.message
 
 
+def _is_json_object(value: JsonValue) -> TypeIs[dict[str, JsonValue]]:
+    return isinstance(value, dict)
+
+
+def test_decorators_preserve_callable_signatures() -> None:
+    schedule: Callable[[ReminderArgs], Awaitable[dict[str, str]]] = schedule_reminder
+    confirm: Callable[[ReminderArgs], Awaitable[str]] = confirm_reminder
+
+    assert schedule is schedule_reminder
+    assert confirm is confirm_reminder
+
+
 def test_pydantic_model_builds_visible_contract() -> None:
     definition = build_definition(schedule_reminder)
     schema = thaw_json_object(definition.spec.parameters)
     properties = schema["properties"]
+
+    assert _is_json_object(properties)
+    message = properties["message"]
+    assert _is_json_object(message)
 
     assert definition.input_parameter == "args"
     assert definition.spec.name == "schedule_reminder"
     assert definition.spec.description == "Programa un recordatorio."
     assert schema["additionalProperties"] is False
     assert set(properties) == {"message", "when", "cron"}
-    assert properties["message"]["minLength"] == 1
-    assert properties["message"]["description"] == "Texto del recordatorio."
+    assert message["minLength"] == 1
+    assert message["description"] == "Texto del recordatorio."
 
 
 def test_pydantic_contract_matches_manual_semantics() -> None:
@@ -74,13 +91,21 @@ def test_pydantic_contract_matches_manual_semantics() -> None:
     )
     explicit = thaw_json_object(manual.parameters)
 
+    generated_properties = generated["properties"]
+    explicit_properties = explicit["properties"]
+    assert _is_json_object(generated_properties)
+    assert _is_json_object(explicit_properties)
+
+    generated_message = generated_properties["message"]
+    explicit_message = explicit_properties["message"]
+    assert _is_json_object(generated_message)
+    assert _is_json_object(explicit_message)
+
     assert generated["required"] == explicit["required"]
     assert generated["additionalProperties"] == explicit["additionalProperties"]
-    assert generated["properties"]["message"]["type"] == "string"
-    assert generated["properties"]["message"]["description"] == (
-        explicit["properties"]["message"]["description"]
-    )
-    assert generated["properties"]["message"]["minLength"] == 1
+    assert generated_message["type"] == "string"
+    assert generated_message["description"] == explicit_message["description"]
+    assert generated_message["minLength"] == 1
 
 
 @pytest.mark.asyncio
@@ -174,8 +199,10 @@ def test_injected_arguments_stay_outside_pydantic_contract() -> None:
         ToolBinding(function=bound, private_arguments={"context": context})
     )
     schema = thaw_json_object(definition.spec.parameters)
+    properties = schema["properties"]
 
-    assert "context" not in schema["properties"]
+    assert _is_json_object(properties)
+    assert "context" not in properties
     assert set(definition.private_arguments) == {"context"}
 
 
