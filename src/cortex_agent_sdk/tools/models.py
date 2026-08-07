@@ -7,6 +7,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, JsonValue, field_serializer, field_validator
 
 from cortex_agent_sdk.immutable import JsonObject, freeze_json_object, thaw_json_object
+from cortex_agent_sdk.tools.approval import ToolApprovalRule
 
 
 class _InjectedMarker:
@@ -73,7 +74,7 @@ class ToolBinding:
     private_arguments: Mapping[str, object] = field(default_factory=dict)
     input_model: type[BaseModel] | None = None
     result_mode: ToolResultMode | None = None
-    needs_approval: bool | None = None
+    needs_approval: ToolApprovalRule | None = None
 
     def __post_init__(self) -> None:
         frozen_arguments = MappingProxyType(dict(self.private_arguments))
