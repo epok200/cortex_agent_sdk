@@ -4,12 +4,13 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from pydantic import JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from cortex_agent_sdk.engine import ToolCall
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import ToolResultPart
 from cortex_agent_sdk.immutable import thaw_json_object
+from cortex_agent_sdk.tools.approval import ToolApprovalRule
 from cortex_agent_sdk.tools.contracts import ToolDefinition, build_definition
 from cortex_agent_sdk.tools.models import (
     ToolBinding,
@@ -99,9 +100,15 @@ class ToolSet:
             return ToolResultMode.CONTINUE
         return definition.result_mode
 
-    def needs_approval(self, name: str) -> bool:
+    def approval_rule(self, name: str) -> ToolApprovalRule | None:
         definition = self._definitions.get(name)
-        return definition is not None and definition.needs_approval
+        if definition is None:
+            return None
+        return definition.needs_approval
+
+    def has_approval_rule(self, name: str) -> bool:
+        rule = self.approval_rule(name)
+        return rule is not None and rule is not False
 
     def is_final_answer(self, name: str) -> bool:
         return self.result_mode(name) is ToolResultMode.FINAL
@@ -112,6 +119,16 @@ class ToolExecutor:
         self._tools = tools
         self._timeout_seconds = timeout_seconds
 
+    def approval_arguments(self, call: ToolCall) -> Mapping[str, object] | None:
+        """Devuelve argumentos públicos ya validados sin ejecutar la tool."""
+        definition = self._tools.definition(call.name)
+        if definition is None:
+            return None
+        validated = _validate_public_model(definition, call)
+        if isinstance(validated, ToolOutcome):
+            return None
+        return MappingProxyType(validated.model_dump())
+
     async def execute(self, call: ToolCall) -> ToolOutcome:
         definition = self._tools.definition(call.name)
         if definition is None:
@@ -121,9 +138,10 @@ class ToolExecutor:
                 "La herramienta solicitada no existe.",
             )
 
-        arguments = _validate_arguments(definition, call)
-        if isinstance(arguments, ToolOutcome):
-            return arguments
+        validated = _validate_public_model(definition, call)
+        if isinstance(validated, ToolOutcome):
+            return validated
+        arguments = _execution_arguments(definition, validated)
 
         try:
             async with asyncio.timeout(self._timeout_seconds):
@@ -155,10 +173,10 @@ class ToolExecutor:
         return ToolOutcome(call, output, False, definition.result_mode)
 
 
-def _validate_arguments(
+def _validate_public_model(
     definition: ToolDefinition,
     call: ToolCall,
-) -> dict[str, object] | ToolOutcome:
+) -> BaseModel | ToolOutcome:
     public_input = thaw_json_object(call.arguments)
     if definition.schema_validator is not None:
         schema_error = next(definition.schema_validator.iter_errors(public_input), None)
@@ -170,7 +188,7 @@ def _validate_arguments(
                 definition.result_mode,
             )
     try:
-        validated = definition.input_model.model_validate(public_input, extra="forbid")
+        return definition.input_model.model_validate(public_input, extra="forbid")
     except ValidationError:
         return _failed_outcome(
             call,
@@ -179,6 +197,11 @@ def _validate_arguments(
             definition.result_mode,
         )
 
+
+def _execution_arguments(
+    definition: ToolDefinition,
+    validated: BaseModel,
+) -> dict[str, object]:
     if definition.input_parameter is not None:
         public_arguments: dict[str, object] = {definition.input_parameter: validated}
     else:
