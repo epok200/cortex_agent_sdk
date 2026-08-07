@@ -34,6 +34,6 @@ class RunState:
     tool_calls: int = 0
     consecutive_tool_failures: int = 0
     last_text: str | None = None
+    fallback_text: str | None = None
     structured: BaseModel | None = None
     effective_model: str | None = None
-
