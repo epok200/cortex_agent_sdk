@@ -103,10 +103,51 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Los type hints son la vía recomendada para tools sencillas. Cortex infiere el contrato visible y
+valida los argumentos antes de ejecutar la función; no hace falta escribir JSON Schema ni
+`ToolSpec` manualmente.
+
+### Contratos Pydantic
+
+Cuando los argumentos forman un contrato reutilizable o tienen validaciones entre campos, puede
+usarse un `BaseModel` como fuente de verdad:
+
+```python
+from datetime import datetime
+from typing import Self
+
+from pydantic import BaseModel, Field, model_validator
+
+from cortex_agent_sdk import final_answer
+
+
+class ReminderArgs(BaseModel):
+    message: str = Field(min_length=1, description="Texto del recordatorio.")
+    when: datetime | None = None
+    cron: str | None = None
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> Self:
+        if (self.when is None) == (self.cron is None):
+            raise ValueError("se requiere exactamente when o cron")
+        return self
+
+
+@final_answer(input_model=ReminderArgs)
+async def schedule_reminder(args: ReminderArgs) -> str:
+    """Programa un recordatorio."""
+    return f"Recordatorio: {args.message}"
+```
+
+Cortex genera el `ToolSpec` neutral a partir del modelo, rechaza propiedades adicionales y entrega a
+la función una instancia ya validada. `ToolBinding(input_model=...)` ofrece la misma capacidad para
+tools construidas en runtime. El `ToolSpec` manual continúa disponible como escape hatch cuando el
+schema visible necesita construirse dinámicamente o requiere control de bajo nivel.
+
 ## Capacidades del alfa
 
 - Loop async acotado.
-- Tools async con schema inferido o explícito.
+- Tools async con schema inferido, Pydantic explícito o `ToolSpec` manual.
 - Historial y sesiones en memoria, Redis o PostgreSQL.
 - Hooks locales.
 - Timeouts para providers y tools.

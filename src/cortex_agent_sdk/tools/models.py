@@ -46,11 +46,12 @@ ToolFunction = Callable[..., Awaitable[object]]
 
 @dataclass(frozen=True, slots=True)
 class ToolBinding:
-    """Une callable, schema opcional y argumentos privados."""
+    """Une callable, contrato opcional y argumentos privados."""
 
     function: ToolFunction
     spec: ToolSpec | None = None
     private_arguments: Mapping[str, object] = field(default_factory=dict)
+    input_model: type[BaseModel] | None = None
 
     def __post_init__(self) -> None:
         frozen_arguments = MappingProxyType(dict(self.private_arguments))
