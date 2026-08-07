@@ -11,7 +11,12 @@ from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import ToolResultPart
 from cortex_agent_sdk.immutable import thaw_json_object
 from cortex_agent_sdk.tools.contracts import ToolDefinition, build_definition
-from cortex_agent_sdk.tools.models import ToolBinding, ToolFunction, ToolSpec
+from cortex_agent_sdk.tools.models import (
+    ToolBinding,
+    ToolFunction,
+    ToolResultMode,
+    ToolSpec,
+)
 
 _JSON_ADAPTER = TypeAdapter(JsonValue)
 
@@ -21,16 +26,24 @@ class ToolOutcome:
     call: ToolCall
     output: str
     failed: bool
-    final_answer: bool
+    result_mode: ToolResultMode = ToolResultMode.CONTINUE
     error_code: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.call, ToolCall) or not isinstance(self.output, str):
             raise TypeError("ToolOutcome inválido")
-        if not isinstance(self.failed, bool) or not isinstance(self.final_answer, bool):
+        if not isinstance(self.failed, bool) or not isinstance(self.result_mode, ToolResultMode):
             raise TypeError("ToolOutcome inválido")
         if self.error_code is not None and not isinstance(self.error_code, str):
             raise TypeError("ToolOutcome inválido")
+
+    @property
+    def final_answer(self) -> bool:
+        return self.result_mode is ToolResultMode.FINAL
+
+    @property
+    def fallback_answer(self) -> bool:
+        return self.result_mode is ToolResultMode.FALLBACK
 
     @classmethod
     def skipped(cls, call: ToolCall) -> "ToolOutcome":
@@ -39,6 +52,12 @@ class ToolOutcome:
             CodigoError.TOOL_OMITIDA_POR_LIMITE,
             "La herramienta se omitió porque se alcanzó el límite de fallas.",
         )
+
+    @classmethod
+    def rejected(cls, call: ToolCall, message: str) -> "ToolOutcome":
+        payload = {"ok": False, "approval": "rejected", "message": message}
+        output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return cls(call=call, output=output, failed=False)
 
     def as_history_part(self) -> ToolResultPart:
         return ToolResultPart(
@@ -74,9 +93,18 @@ class ToolSet:
     def definition(self, name: str) -> ToolDefinition | None:
         return self._definitions.get(name)
 
-    def is_final_answer(self, name: str) -> bool:
+    def result_mode(self, name: str) -> ToolResultMode:
         definition = self._definitions.get(name)
-        return definition is not None and definition.is_final_answer
+        if definition is None:
+            return ToolResultMode.CONTINUE
+        return definition.result_mode
+
+    def needs_approval(self, name: str) -> bool:
+        definition = self._definitions.get(name)
+        return definition is not None and definition.needs_approval
+
+    def is_final_answer(self, name: str) -> bool:
+        return self.result_mode(name) is ToolResultMode.FINAL
 
 
 class ToolExecutor:
@@ -105,11 +133,11 @@ class ToolExecutor:
                 call,
                 CodigoError.TOOL_TIMEOUT,
                 "La herramienta agotó su tiempo de ejecución.",
-                definition.is_final_answer,
+                definition.result_mode,
             )
         except AppError as error:
             message = error.mensaje_seguro or "La herramienta no pudo completar la operación."
-            return _failed_outcome(call, error.codigo, message, definition.is_final_answer)
+            return _failed_outcome(call, error.codigo, message, definition.result_mode)
         except Exception as error:
             detail = f"{call.name} lanzó {type(error).__name__}"
             raise AppError(
@@ -124,7 +152,7 @@ class ToolExecutor:
                 f"{call.name} debe devolver str",
             )
         output = _serialize_result(result, call.name)
-        return ToolOutcome(call, output, False, definition.is_final_answer)
+        return ToolOutcome(call, output, False, definition.result_mode)
 
 
 def _validate_arguments(
@@ -139,7 +167,7 @@ def _validate_arguments(
                 call,
                 CodigoError.TOOL_ARGUMENTOS_INVALIDOS,
                 "Los argumentos de la herramienta son inválidos.",
-                definition.is_final_answer,
+                definition.result_mode,
             )
     try:
         validated = definition.input_model.model_validate(public_input, extra="forbid")
@@ -148,7 +176,7 @@ def _validate_arguments(
             call,
             CodigoError.TOOL_ARGUMENTOS_INVALIDOS,
             "Los argumentos de la herramienta son inválidos.",
-            definition.is_final_answer,
+            definition.result_mode,
         )
 
     if definition.input_parameter is not None:
@@ -175,8 +203,8 @@ def _failed_outcome(
     call: ToolCall,
     code: CodigoError,
     message: str,
-    is_final_answer: bool = False,
+    result_mode: ToolResultMode = ToolResultMode.CONTINUE,
 ) -> ToolOutcome:
     payload = {"ok": False, "error": {"code": code.value, "message": message}}
     output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return ToolOutcome(call, output, True, is_final_answer, code.value)
+    return ToolOutcome(call, output, True, result_mode, code.value)
