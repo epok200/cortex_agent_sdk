@@ -1,5 +1,6 @@
 from typing import Protocol, cast, overload
 
+from cortex_agent_sdk.tools.approval import ToolApprovalRule
 from cortex_agent_sdk.tools.models import (
     ToolDecorator,
     ToolDecoratorResult,
@@ -15,14 +16,14 @@ class _ToolMetadata(Protocol):
     __cortex_tool__: bool
     __cortex_input_model__: ToolInputModel
     __cortex_result_mode__: ToolResultMode
-    __cortex_needs_approval__: bool
+    __cortex_needs_approval__: ToolApprovalRule
 
 
 def _decorator(
     *,
     input_model: ToolInputModel | None,
     result_mode: ToolResultMode,
-    needs_approval: bool,
+    needs_approval: ToolApprovalRule,
 ) -> ToolDecorator:
     def decorate[TTool: ToolFunction](function: TTool) -> TTool:
         metadata = cast(_ToolMetadata, function)
@@ -46,7 +47,7 @@ def tool[TTool: ToolFunction](function: TTool, /) -> TTool: ...
 def tool(
     *,
     input_model: ToolInputModel | None = None,
-    needs_approval: bool = False,
+    needs_approval: ToolApprovalRule = False,
 ) -> ToolDecorator: ...
 
 
@@ -54,7 +55,7 @@ def tool[TTool: ToolFunction](
     function: TTool | None = None,
     *,
     input_model: ToolInputModel | None = None,
-    needs_approval: bool = False,
+    needs_approval: ToolApprovalRule = False,
 ) -> ToolDecoratorResult[TTool]:
     """Marca una tool que devuelve su resultado al modelo y continúa el loop."""
     decorator = _decorator(
@@ -77,7 +78,7 @@ def fallback_answer[TTool: ToolFunction](function: TTool, /) -> TTool: ...
 def fallback_answer(
     *,
     input_model: ToolInputModel | None = None,
-    needs_approval: bool = False,
+    needs_approval: ToolApprovalRule = False,
 ) -> ToolDecorator: ...
 
 
@@ -85,7 +86,7 @@ def fallback_answer[TTool: ToolFunction](
     function: TTool | None = None,
     *,
     input_model: ToolInputModel | None = None,
-    needs_approval: bool = False,
+    needs_approval: ToolApprovalRule = False,
 ) -> ToolDecoratorResult[TTool]:
     """Marca una tool cuyo último resultado puede rescatar un cierre limpio sin texto."""
     decorator = _decorator(
@@ -108,7 +109,7 @@ def final_answer[TTool: ToolFunction](function: TTool, /) -> TTool: ...
 def final_answer(
     *,
     input_model: ToolInputModel | None = None,
-    needs_approval: bool = False,
+    needs_approval: ToolApprovalRule = False,
 ) -> ToolDecorator: ...
 
 
@@ -116,7 +117,7 @@ def final_answer[TTool: ToolFunction](
     function: TTool | None = None,
     *,
     input_model: ToolInputModel | None = None,
-    needs_approval: bool = False,
+    needs_approval: ToolApprovalRule = False,
 ) -> ToolDecoratorResult[TTool]:
     """Marca una tool cuyo resultado exitoso termina el run inmediatamente."""
     decorator = _decorator(
