@@ -1,65 +1,77 @@
-from collections.abc import Callable
 from typing import overload
 
-from pydantic import BaseModel
+from cortex_agent_sdk.tools.models import (
+    ToolDecorator,
+    ToolDecoratorResult,
+    ToolFunction,
+    ToolInputModel,
+)
 
-from cortex_agent_sdk.tools.models import ToolFunction
 
-
-@overload
-def tool[F: ToolFunction](function: F, /) -> F: ...
-
-
-@overload
-def tool[F: ToolFunction](
+def _decorator(
     *,
-    input_model: type[BaseModel] | None = None,
-) -> Callable[[F], F]: ...
+    input_model: ToolInputModel | None,
+    final_answer: bool,
+) -> ToolDecorator:
+    def decorate[TTool: ToolFunction](function: TTool) -> TTool:
+        setattr(function, "__cortex_tool__", True)
+
+        if final_answer:
+            setattr(function, "__cortex_final_answer__", True)
+
+        if input_model is not None:
+            setattr(function, "__cortex_input_model__", input_model)
+
+        return function
+
+    return decorate
 
 
+@overload
+def tool[TTool: ToolFunction](function: TTool, /) -> TTool: ...
+
+
+@overload
 def tool(
-    function: ToolFunction | None = None,
     *,
-    input_model: type[BaseModel] | None = None,
-) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
+    input_model: ToolInputModel | None = None,
+) -> ToolDecorator: ...
+
+
+def tool[TTool: ToolFunction](
+    function: TTool | None = None,
+    *,
+    input_model: ToolInputModel | None = None,
+) -> ToolDecoratorResult[TTool]:
     """Marca una tool y permite declarar un contrato Pydantic explícito."""
-
-    def decorate(inner: ToolFunction) -> ToolFunction:
-        inner.__cortex_tool__ = True  # type: ignore[attr-defined]
-        if input_model is not None:
-            inner.__cortex_input_model__ = input_model  # type: ignore[attr-defined]
-        return inner
+    decorator = _decorator(input_model=input_model, final_answer=False)
 
     if function is None:
-        return decorate
-    return decorate(function)
+        return decorator
+
+    return decorator(function)
 
 
 @overload
-def final_answer[F: ToolFunction](function: F, /) -> F: ...
+def final_answer[TTool: ToolFunction](function: TTool, /) -> TTool: ...
 
 
 @overload
-def final_answer[F: ToolFunction](
-    *,
-    input_model: type[BaseModel] | None = None,
-) -> Callable[[F], F]: ...
-
-
 def final_answer(
-    function: ToolFunction | None = None,
     *,
-    input_model: type[BaseModel] | None = None,
-) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
-    """Marca una tool terminal y permite un contrato Pydantic explícito."""
+    input_model: ToolInputModel | None = None,
+) -> ToolDecorator: ...
 
-    def decorate(inner: ToolFunction) -> ToolFunction:
-        inner.__cortex_tool__ = True  # type: ignore[attr-defined]
-        inner.__cortex_final_answer__ = True  # type: ignore[attr-defined]
-        if input_model is not None:
-            inner.__cortex_input_model__ = input_model  # type: ignore[attr-defined]
-        return inner
+
+def final_answer[TTool: ToolFunction](
+    function: TTool | None = None,
+    *,
+    input_model: ToolInputModel | None = None,
+) -> ToolDecoratorResult[TTool]:
+    """Marca una tool terminal y permite un contrato Pydantic explícito."""
+    decorator = _decorator(input_model=input_model, final_answer=True)
 
     if function is None:
-        return decorate
-    return decorate(function)
+        return decorator
+
+    return decorator(function)
