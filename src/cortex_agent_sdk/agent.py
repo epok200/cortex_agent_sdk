@@ -1,11 +1,22 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from functools import partial
+from inspect import isawaitable
 from typing import Self
 from uuid import uuid4
 
 from pydantic import BaseModel
 
+from cortex_agent_sdk.control import (
+    ApprovalAction,
+    ApprovalDecision,
+    ContinueRun,
+    FinalOutput,
+    PendingRun,
+    ToolApproval,
+    ToolResultContext,
+    ToolResultPolicy,
+)
 from cortex_agent_sdk.engine import EngineRequest, EngineResult, ModelEngine, ToolCall
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import Turn
@@ -36,6 +47,7 @@ class Agent:
         options: AgentOptions | None = None,
         own_engine: bool = True,
         own_session_store: bool = False,
+        tool_result_policy: ToolResultPolicy | None = None,
     ) -> None:
         self._engine = engine
         self._instructions = instructions
@@ -49,6 +61,7 @@ class Agent:
             self._session_store = session_store
         self._own_engine = own_engine
         self._own_session_store = session_store is None or own_session_store
+        self._tool_result_policy = tool_result_policy
         self._lifecycle = AgentLifecycle()
 
     async def __aenter__(self) -> Self:
@@ -104,6 +117,53 @@ class Agent:
                 finally:
                     await lease_keeper.aclose()
 
+    async def resume(
+        self,
+        pending_run: PendingRun,
+        *,
+        tools: Iterable[ToolFunction | ToolBinding] = (),
+        response_model: type[BaseModel] | None = None,
+    ) -> AgentResult:
+        """Reanuda un run pausado después de resolver sus approvals."""
+        async with self._lifecycle.run():
+            self._validate_pending_identity(pending_run)
+            self._validate_response_model(pending_run, response_model)
+            if pending_run.unresolved:
+                return self._pending_result_from_snapshot(pending_run)
+
+            tool_set = ToolSet.build((*self._static_tools, *tuple(tools)))
+            if pending_run.session_id is None:
+                state = self._state_from_pending(pending_run, None, None)
+                return await self._resume_pending(
+                    state,
+                    pending_run,
+                    tool_set,
+                    response_model,
+                )
+
+            session_id = pending_run.session_id
+            timeout = self._options.session_lock_timeout_seconds
+            async with self._session_store.acquire(session_id, timeout) as lease:
+                lease_keeper = LeaseKeeper(lease)
+                await lease_keeper.start()
+                try:
+                    record = await lease_keeper.load()
+                    if record is None:
+                        raise AppError(
+                            CodigoError.SESION_INVALIDA,
+                            f"no existe la sesión pausada {session_id}",
+                        )
+                    self._validate_pending_record(record, pending_run)
+                    state = self._state_from_pending(pending_run, record, lease_keeper)
+                    return await self._resume_pending(
+                        state,
+                        pending_run,
+                        tool_set,
+                        response_model,
+                    )
+                finally:
+                    await lease_keeper.aclose()
+
     async def reset_session(self, session_id: str) -> None:
         async with self._lifecycle.run():
             if not session_id:
@@ -133,30 +193,133 @@ class Agent:
         tool_set: ToolSet,
         response_model: type[BaseModel] | None,
         session_id: str | None,
+        *,
+        start_step: int = 1,
     ) -> AgentResult:
         executor = ToolExecutor(tool_set, self._options.tool_timeout_seconds)
-        for step in range(1, self._options.max_steps + 1):
+        for step in range(start_step, self._options.max_steps + 1):
             engine_result = await self._generate(state, tool_set, response_model, session_id)
             self._record_engine_result(state, engine_result)
 
             if not engine_result.tool_calls:
+                if self._should_use_fallback(state, engine_result, response_model):
+                    state.last_text = state.fallback_text
+                    return await self._finish(state, AgentExitReason.FALLBACK_ANSWER, step)
                 return await self._finish(state, AgentExitReason.COMPLETED, step)
 
             self._validate_tool_batch(tool_set, engine_result.tool_calls)
             await self._start_tool_calls(state, engine_result.tool_calls)
+            interruptions = self._approval_requests(tool_set, engine_result.tool_calls)
+            if interruptions:
+                pending = self._build_pending_run(
+                    state,
+                    engine_result.tool_calls,
+                    interruptions,
+                    response_model,
+                    session_id,
+                    step,
+                )
+                return self._pause_for_approval(state, pending)
+
             outcomes = await self._execute_tool_calls(state, executor, engine_result.tool_calls)
             await self._finish_tool_calls(state)
-
-            if state.consecutive_tool_failures >= self._options.max_consecutive_tool_failures:
-                return await self._finish(state, AgentExitReason.TOOL_FAILURE_LIMIT, step)
-            all_final = outcomes and all(
-                outcome.final_answer and not outcome.failed for outcome in outcomes
-            )
-            if all_final:
-                state.last_text = "\n\n".join(outcome.output for outcome in outcomes)
-                return await self._finish(state, AgentExitReason.FINAL_ANSWER, step)
+            finished = await self._after_tool_batch(state, outcomes, step, session_id)
+            if finished is not None:
+                return finished
 
         return await self._finish(state, AgentExitReason.MAX_STEPS, self._options.max_steps)
+
+    async def _resume_pending(
+        self,
+        state: RunState,
+        pending_run: PendingRun,
+        tool_set: ToolSet,
+        response_model: type[BaseModel] | None,
+    ) -> AgentResult:
+        self._validate_tool_batch(tool_set, pending_run.calls)
+        self._validate_pending_tools(tool_set, pending_run)
+        executor = ToolExecutor(tool_set, self._options.tool_timeout_seconds)
+        outcomes = await self._execute_tool_calls(
+            state,
+            executor,
+            pending_run.calls,
+            decisions=pending_run.decisions,
+        )
+        await self._finish_tool_calls(state)
+        finished = await self._after_tool_batch(
+            state,
+            outcomes,
+            pending_run.step,
+            pending_run.session_id,
+        )
+        if finished is not None:
+            return finished
+        if pending_run.step >= self._options.max_steps:
+            return await self._finish(
+                state,
+                AgentExitReason.MAX_STEPS,
+                self._options.max_steps,
+            )
+        return await self._run_loop(
+            state,
+            tool_set,
+            response_model,
+            pending_run.session_id,
+            start_step=pending_run.step + 1,
+        )
+
+    async def _after_tool_batch(
+        self,
+        state: RunState,
+        outcomes: tuple[ToolOutcome, ...],
+        step: int,
+        session_id: str | None,
+    ) -> AgentResult | None:
+        if state.consecutive_tool_failures >= self._options.max_consecutive_tool_failures:
+            return await self._finish(state, AgentExitReason.TOOL_FAILURE_LIMIT, step)
+
+        for outcome in outcomes:
+            if outcome.fallback_answer and not outcome.failed:
+                state.fallback_text = outcome.output
+
+        all_final = outcomes and all(
+            outcome.final_answer and not outcome.failed for outcome in outcomes
+        )
+        if all_final:
+            state.last_text = "\n\n".join(outcome.output for outcome in outcomes)
+            return await self._finish(state, AgentExitReason.FINAL_ANSWER, step)
+
+        policy_result = await self._run_tool_result_policy(state, outcomes, step, session_id)
+        if isinstance(policy_result, FinalOutput):
+            state.last_text = policy_result.output
+            return await self._finish(state, AgentExitReason.TOOL_POLICY, step)
+        return None
+
+    async def _run_tool_result_policy(
+        self,
+        state: RunState,
+        outcomes: tuple[ToolOutcome, ...],
+        step: int,
+        session_id: str | None,
+    ) -> ContinueRun | FinalOutput:
+        if self._tool_result_policy is None:
+            return ContinueRun()
+
+        context = ToolResultContext(
+            step=step,
+            session_id=session_id,
+            history=tuple(state.history),
+            outcomes=outcomes,
+        )
+        decision = self._tool_result_policy(context)
+        if isawaitable(decision):
+            decision = await decision
+        if not isinstance(decision, ContinueRun | FinalOutput):
+            raise AppError(
+                CodigoError.CONFIG_INVALIDA,
+                "tool_result_policy devolvió una decisión inválida",
+            )
+        return decision
 
     async def _generate(
         self,
@@ -194,6 +357,106 @@ class Agent:
         state.structured = result.structured or state.structured
         state.effective_model = result.model
 
+    def _should_use_fallback(
+        self,
+        state: RunState,
+        result: EngineResult,
+        response_model: type[BaseModel] | None,
+    ) -> bool:
+        clean_stop = result.stop_reason in {None, "completed", "stop"}
+        return (
+            response_model is None
+            and state.fallback_text is not None
+            and not result.turn.text
+            and clean_stop
+        )
+
+    def _approval_requests(
+        self,
+        tool_set: ToolSet,
+        calls: tuple[ToolCall, ...],
+    ) -> tuple[ToolApproval, ...]:
+        return tuple(
+            ToolApproval.from_call(call) for call in calls if tool_set.needs_approval(call.name)
+        )
+
+    def _build_pending_run(
+        self,
+        state: RunState,
+        calls: tuple[ToolCall, ...],
+        interruptions: tuple[ToolApproval, ...],
+        response_model: type[BaseModel] | None,
+        session_id: str | None,
+        step: int,
+    ) -> PendingRun:
+        return PendingRun(
+            provider=self._engine.provider,
+            model=self._engine.model,
+            instructions=state.instructions,
+            history=tuple(state.history),
+            step=step,
+            usage=state.usage,
+            tool_calls=state.tool_calls,
+            consecutive_tool_failures=state.consecutive_tool_failures,
+            last_text=state.last_text,
+            fallback_text=state.fallback_text,
+            effective_model=state.effective_model,
+            session_id=session_id,
+            calls=calls,
+            interruptions=interruptions,
+            response_model_name=_response_model_name(response_model),
+        )
+
+    def _pause_for_approval(self, state: RunState, pending_run: PendingRun) -> AgentResult:
+        return AgentResult(
+            text=state.last_text,
+            reason=AgentExitReason.APPROVAL_REQUIRED,
+            usage=state.usage,
+            steps=pending_run.step,
+            tool_calls=state.tool_calls,
+            provider=self._engine.provider,
+            model=state.effective_model or self._engine.model,
+            history=tuple(state.history),
+            raw_responses=tuple(state.raw_responses),
+            structured=state.structured,
+            interruptions=pending_run.unresolved,
+            pending_run=pending_run,
+        )
+
+    def _pending_result_from_snapshot(self, pending_run: PendingRun) -> AgentResult:
+        return AgentResult(
+            text=pending_run.last_text,
+            reason=AgentExitReason.APPROVAL_REQUIRED,
+            usage=pending_run.usage,
+            steps=pending_run.step,
+            tool_calls=pending_run.tool_calls,
+            provider=pending_run.provider,
+            model=pending_run.effective_model or pending_run.model,
+            history=pending_run.history,
+            raw_responses=(),
+            interruptions=pending_run.unresolved,
+            pending_run=pending_run,
+        )
+
+    def _state_from_pending(
+        self,
+        pending_run: PendingRun,
+        record: SessionRecord | None,
+        lease_keeper: LeaseKeeper | None,
+    ) -> RunState:
+        return RunState(
+            history=list(pending_run.history),
+            record=record,
+            lease_keeper=lease_keeper,
+            instructions=pending_run.instructions,
+            usage=pending_run.usage,
+            tool_calls=pending_run.tool_calls,
+            consecutive_tool_failures=pending_run.consecutive_tool_failures,
+            last_text=pending_run.last_text,
+            fallback_text=pending_run.fallback_text,
+            effective_model=pending_run.effective_model,
+        )
+
     async def _start_tool_calls(
         self,
         state: RunState,
@@ -210,14 +473,25 @@ class Agent:
         state: RunState,
         executor: ToolExecutor,
         calls: tuple[ToolCall, ...],
+        *,
+        decisions: dict[str, ApprovalDecision] | None = None,
     ) -> tuple[ToolOutcome, ...]:
         outcomes: list[ToolOutcome] = []
         for original_call in calls:
+            decision = None if decisions is None else decisions.get(original_call.call_id)
+            if decision is not None and decision.action is ApprovalAction.REJECT:
+                message = decision.rejection_message or "La ejecución fue rechazada por el usuario."
+                outcome = ToolOutcome.rejected(original_call, message)
+                await self._checkpoint_outcome(state, outcome)
+                outcomes.append(outcome)
+                continue
+
             if state.consecutive_tool_failures >= self._options.max_consecutive_tool_failures:
                 outcome = ToolOutcome.skipped(original_call)
                 await self._checkpoint_outcome(state, outcome)
                 outcomes.append(outcome)
                 continue
+
             call = await self._hooks.run_before_tool(original_call)
             if call.call_id != original_call.call_id or call.name != original_call.name:
                 raise AppError(CodigoError.HOOK_FALLO, "before_tool cambió identidad de la call")
@@ -292,6 +566,65 @@ class Agent:
                 "provider mezcló una tool terminal con otras calls en el mismo paso",
             )
 
+    def _validate_pending_identity(self, pending_run: PendingRun) -> None:
+        if pending_run.provider != self._engine.provider or pending_run.model != self._engine.model:
+            raise AppError(
+                CodigoError.SESION_ENGINE_DISTINTO,
+                f"run ligado a {pending_run.provider}/{pending_run.model}",
+            )
+        if pending_run.step > self._options.max_steps:
+            raise AppError(CodigoError.CONFIG_INVALIDA, "pending_run excede max_steps")
+
+    def _validate_response_model(
+        self,
+        pending_run: PendingRun,
+        response_model: type[BaseModel] | None,
+    ) -> None:
+        if pending_run.response_model_name != _response_model_name(response_model):
+            raise AppError(
+                CodigoError.CONFIG_INVALIDA,
+                "response_model no coincide con el run pausado",
+            )
+
+    def _validate_pending_tools(self, tool_set: ToolSet, pending_run: PendingRun) -> None:
+        for call in pending_run.calls:
+            if tool_set.definition(call.name) is None:
+                raise AppError(
+                    CodigoError.CONFIG_INVALIDA,
+                    f"falta tool para reanudar: {call.name}",
+                )
+        expected = {
+            call.call_id for call in pending_run.calls if tool_set.needs_approval(call.name)
+        }
+        recorded = {item.call_id for item in pending_run.interruptions}
+        if expected != recorded:
+            raise AppError(
+                CodigoError.CONFIG_INVALIDA,
+                "las reglas de approval cambiaron desde la pausa",
+            )
+
+    def _validate_pending_record(self, record: SessionRecord, pending_run: PendingRun) -> None:
+        session_id = pending_run.session_id
+        if session_id is None or record.session_id != session_id:
+            raise AppError(CodigoError.SESION_INVALIDA, "sesión de resume inválida")
+        if record.provider != self._engine.provider or record.model != self._engine.model:
+            raise AppError(
+                CodigoError.SESION_ENGINE_DISTINTO,
+                f"sesión ligada a {record.provider}/{record.model}",
+            )
+        active = record.active_turn
+        expected_calls = tuple(call.call_id for call in pending_run.calls)
+        if active is None or active.pending_call_ids != expected_calls or active.completed_call_ids:
+            raise AppError(
+                CodigoError.SESION_RECUPERACION_REQUERIDA,
+                f"estado pausado inválido en sesión {record.session_id}",
+            )
+        if record.history != pending_run.history:
+            raise AppError(
+                CodigoError.SESION_CONFLICTO,
+                f"la sesión {record.session_id} cambió durante la pausa",
+            )
+
     async def _save_record(self, state: RunState) -> None:
         if state.record is None or state.lease_keeper is None:
             return
@@ -322,3 +655,9 @@ class Agent:
                 CodigoError.SESION_ENGINE_DISTINTO,
                 f"sesión ligada a {record.provider}/{record.model}",
             )
+
+
+def _response_model_name(model: type[BaseModel] | None) -> str | None:
+    if model is None:
+        return None
+    return f"{model.__module__}:{model.__qualname__}"
