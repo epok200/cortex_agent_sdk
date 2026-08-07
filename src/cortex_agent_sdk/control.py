@@ -3,12 +3,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cortex_agent_sdk.engine import ToolCall, Usage
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import Turn
-from cortex_agent_sdk.immutable import JsonObject
+from cortex_agent_sdk.immutable import JsonObject, freeze_json_object
 from cortex_agent_sdk.tools.execution import ToolOutcome
 
 
@@ -32,6 +32,11 @@ class ToolApproval(BaseModel):
     call_id: str
     tool_name: str
     arguments: JsonObject
+
+    @field_validator("arguments", mode="after")
+    @classmethod
+    def freeze_arguments(cls, value: JsonObject) -> JsonObject:
+        return freeze_json_object(value)
 
     @classmethod
     def from_call(cls, call: ToolCall) -> "ToolApproval":
@@ -62,12 +67,19 @@ class PendingRun(BaseModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
-        call_ids = tuple(call.call_id for call in self.calls)
-        interruption_ids = {item.call_id for item in self.interruptions}
-        if len(call_ids) != len(set(call_ids)):
+        calls = {call.call_id: call for call in self.calls}
+        if len(calls) != len(self.calls):
             raise ValueError("calls contiene call_id duplicado")
-        if not interruption_ids or not interruption_ids <= set(call_ids):
+
+        interruption_ids = {item.call_id for item in self.interruptions}
+        if not interruption_ids or not interruption_ids <= set(calls):
             raise ValueError("interruptions no coincide con calls")
+
+        for interruption in self.interruptions:
+            call = calls[interruption.call_id]
+            if interruption.tool_name != call.name or interruption.arguments != call.arguments:
+                raise ValueError("interruption no coincide con la tool call aprobable")
+
         if not set(self.decisions) <= interruption_ids:
             raise ValueError("decisions contiene call_id sin aprobación pendiente")
         return self
