@@ -212,7 +212,40 @@ if result.pending_run is not None:
 ```
 
 Mientras existe una interruption, la tool sensible todavía no se ha ejecutado. Un rechazo tampoco la
-ejecuta: se registra un resultado visible para el modelo y el loop puede continuar de forma segura.
+ejecuta: Cortex produce un resultado de rechazo visible para el modelo y continúa el loop sin pasar
+esa call por los hooks ni por el executor. La decisión es por `call_id`; si el modelo intenta de nuevo
+la misma acción genera una nueva call y vuelve a evaluarse la regla de aprobación.
+
+La call aprobada queda ligada a su nombre y argumentos originales. Al reanudar, un `before_tool` no
+puede modificar una call ya aprobada: lo que el usuario autorizó es exactamente lo que Cortex permite
+ejecutar.
+
+`needs_approval` también puede ser un callable sync o async. Cortex valida primero los argumentos
+públicos de la tool y entrega al predicate el contexto del run, los argumentos parseados y el
+`call_id`:
+
+```python
+from collections.abc import Mapping
+
+from cortex_agent_sdk import ToolApprovalContext, tool
+
+
+def requiere_revision(
+    context: ToolApprovalContext,
+    argumentos: Mapping[str, object],
+    call_id: str,
+) -> bool:
+    return argumentos["cantidad"] > 10
+
+
+@tool(needs_approval=requiere_revision)
+async def eliminar_eventos(cantidad: int) -> str:
+    return f"Eliminados {cantidad} eventos"
+```
+
+Si los argumentos son inválidos, el predicate no se ejecuta y la llamada sigue el flujo normal de
+error de argumentos. El callable permite que una misma tool sea automática para operaciones seguras y
+requiera intervención humana sólo cuando los datos concretos de esa call lo ameritan.
 
 `PendingRun` es serializable mediante `to_json()` y recuperable con `PendingRun.from_json(...)`. Si el
 run usó tools entregadas directamente a `Agent.run(...)`, deben proporcionarse de nuevo a
@@ -220,16 +253,13 @@ run usó tools entregadas directamente a `Agent.run(...)`, deben proporcionarse 
 sesiones persistentes, Cortex conserva el `active_turn` durante la pausa y lo cierra únicamente al
 resolver la tanda pendiente.
 
-En `0.1.0`, `needs_approval` es deliberadamente booleano. La aprobación dinámica mediante callable
-queda reservada para una evolución posterior, después de estabilizar la frontera pause/resume.
-
 ## Capacidades del alfa
 
 - Loop async acotado y multi-tool.
 - Tools async con schema inferido, Pydantic explícito o `ToolSpec` manual.
 - Semánticas `continue`, `fallback` y `final` para resultados de tools.
 - Policy post-tool opcional.
-- Human-in-the-loop con pause, approve/reject, serialización y resume.
+- Human-in-the-loop con approval estático o dinámico, pause, approve/reject, serialización y resume.
 - Historial y sesiones en memoria, Redis o PostgreSQL.
 - Hooks locales.
 - Timeouts para providers y tools.
