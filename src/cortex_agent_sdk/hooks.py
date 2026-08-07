@@ -63,7 +63,8 @@ class HookChain:
                 if not isinstance(replacement, ToolCall):
                     self._invalid("before_tool")
                 try:
-                    current = ToolCall.model_validate(replacement.model_dump(round_trip=True))
+                    payload = replacement.model_dump(mode="json", round_trip=True)
+                    current = ToolCall.model_validate(payload)
                 except ValueError:
                     self._invalid("before_tool")
         return current
@@ -99,4 +100,3 @@ class HookChain:
 
     def _invalid(self, name: str) -> Never:
         raise AppError(CodigoError.HOOK_FALLO, f"retorno inválido en {name}")
-
