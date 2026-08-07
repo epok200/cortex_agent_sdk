@@ -10,6 +10,7 @@ from cortex_agent_sdk.control import (
     ToolResultPolicy,
 )
 from cortex_agent_sdk.results import AgentResult
+from cortex_agent_sdk.tools.approval import ToolApprovalContext
 from cortex_agent_sdk.tools.decorators import fallback_answer, final_answer, tool
 
 __version__ = _package_version("cortex-agent-sdk")
