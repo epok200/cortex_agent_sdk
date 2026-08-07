@@ -1,22 +1,20 @@
 from collections.abc import Callable
-from typing import TypeVar, overload
+from typing import overload
 
 from pydantic import BaseModel
 
 from cortex_agent_sdk.tools.models import ToolFunction
 
-_ToolCallable = TypeVar("_ToolCallable", bound=ToolFunction)
+
+@overload
+def tool[F: ToolFunction](function: F, /) -> F: ...
 
 
 @overload
-def tool(function: _ToolCallable, /) -> _ToolCallable: ...
-
-
-@overload
-def tool(
+def tool[F: ToolFunction](
     *,
     input_model: type[BaseModel] | None = None,
-) -> Callable[[_ToolCallable], _ToolCallable]: ...
+) -> Callable[[F], F]: ...
 
 
 def tool(
@@ -38,14 +36,14 @@ def tool(
 
 
 @overload
-def final_answer(function: _ToolCallable, /) -> _ToolCallable: ...
+def final_answer[F: ToolFunction](function: F, /) -> F: ...
 
 
 @overload
-def final_answer(
+def final_answer[F: ToolFunction](
     *,
     input_model: type[BaseModel] | None = None,
-) -> Callable[[_ToolCallable], _ToolCallable]: ...
+) -> Callable[[F], F]: ...
 
 
 def final_answer(
