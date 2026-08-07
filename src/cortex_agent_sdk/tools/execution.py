@@ -142,7 +142,7 @@ def _validate_arguments(
                 definition.is_final_answer,
             )
     try:
-        public_arguments = definition.input_model.model_validate(public_input).model_dump()
+        validated = definition.input_model.model_validate(public_input, extra="forbid")
     except ValidationError:
         return _failed_outcome(
             call,
@@ -150,6 +150,11 @@ def _validate_arguments(
             "Los argumentos de la herramienta son inválidos.",
             definition.is_final_answer,
         )
+
+    if definition.input_parameter is not None:
+        public_arguments: dict[str, object] = {definition.input_parameter: validated}
+    else:
+        public_arguments = validated.model_dump()
     return {**public_arguments, **definition.private_arguments}
 
 
