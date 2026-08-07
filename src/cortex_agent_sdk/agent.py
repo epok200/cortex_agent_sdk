@@ -28,6 +28,7 @@ from cortex_agent_sdk.results import AgentExitReason, AgentResult
 from cortex_agent_sdk.runtime import AgentOptions, RunState
 from cortex_agent_sdk.sessions import MemorySessionStore, SessionRecord, SessionStore
 from cortex_agent_sdk.sessions.lease import LeaseKeeper
+from cortex_agent_sdk.tools.approval import ToolApprovalContext
 from cortex_agent_sdk.tools.execution import ToolExecutor, ToolOutcome, ToolSet
 from cortex_agent_sdk.tools.models import ToolBinding, ToolFunction
 
@@ -209,7 +210,14 @@ class Agent:
 
             self._validate_tool_batch(tool_set, engine_result.tool_calls)
             await self._start_tool_calls(state, engine_result.tool_calls)
-            interruptions = self._approval_requests(tool_set, engine_result.tool_calls)
+            interruptions = await self._approval_requests(
+                state,
+                tool_set,
+                executor,
+                engine_result.tool_calls,
+                step,
+                session_id,
+            )
             if interruptions:
                 pending = self._build_pending_run(
                     state,
@@ -371,14 +379,51 @@ class Agent:
             and clean_stop
         )
 
-    def _approval_requests(
+    async def _approval_requests(
         self,
+        state: RunState,
         tool_set: ToolSet,
+        executor: ToolExecutor,
         calls: tuple[ToolCall, ...],
+        step: int,
+        session_id: str | None,
     ) -> tuple[ToolApproval, ...]:
-        return tuple(
-            ToolApproval.from_call(call) for call in calls if tool_set.needs_approval(call.name)
+        context = ToolApprovalContext(
+            step=step,
+            session_id=session_id,
+            history=tuple(state.history),
         )
+        approvals: list[ToolApproval] = []
+        for call in calls:
+            rule = tool_set.approval_rule(call.name)
+            if rule is None or rule is False:
+                continue
+            if rule is True:
+                approvals.append(ToolApproval.from_call(call))
+                continue
+
+            arguments = executor.approval_arguments(call)
+            if arguments is None:
+                continue
+            try:
+                decision = rule(context, arguments, call.call_id)
+                if isawaitable(decision):
+                    decision = await decision
+            except AppError:
+                raise
+            except Exception as error:
+                raise AppError(
+                    CodigoError.CONFIG_INVALIDA,
+                    f"needs_approval de {call.name} lanzó {type(error).__name__}",
+                ) from error
+            if not isinstance(decision, bool):
+                raise AppError(
+                    CodigoError.CONFIG_INVALIDA,
+                    f"needs_approval de {call.name} debe devolver bool",
+                )
+            if decision:
+                approvals.append(ToolApproval.from_call(call))
+        return tuple(approvals)
 
     def _build_pending_run(
         self,
@@ -493,8 +538,15 @@ class Agent:
                 continue
 
             call = await self._hooks.run_before_tool(original_call)
-            if call.call_id != original_call.call_id or call.name != original_call.name:
+            if decision is not None and decision.action is ApprovalAction.APPROVE:
+                if call != original_call:
+                    raise AppError(
+                        CodigoError.HOOK_FALLO,
+                        "before_tool cambió una call después de su aprobación",
+                    )
+            elif call.call_id != original_call.call_id or call.name != original_call.name:
                 raise AppError(CodigoError.HOOK_FALLO, "before_tool cambió identidad de la call")
+
             original_outcome = await self._with_lease(
                 state,
                 partial(executor.execute, call),
@@ -593,15 +645,12 @@ class Agent:
                     CodigoError.CONFIG_INVALIDA,
                     f"falta tool para reanudar: {call.name}",
                 )
-        expected = {
-            call.call_id for call in pending_run.calls if tool_set.needs_approval(call.name)
-        }
-        recorded = {item.call_id for item in pending_run.interruptions}
-        if expected != recorded:
-            raise AppError(
-                CodigoError.CONFIG_INVALIDA,
-                "las reglas de approval cambiaron desde la pausa",
-            )
+        for interruption in pending_run.interruptions:
+            if not tool_set.has_approval_rule(interruption.tool_name):
+                raise AppError(
+                    CodigoError.CONFIG_INVALIDA,
+                    f"la tool {interruption.tool_name} ya no admite approval",
+                )
 
     def _validate_pending_record(self, record: SessionRecord, pending_run: PendingRun) -> None:
         session_id = pending_run.session_id
