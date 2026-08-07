@@ -1,6 +1,7 @@
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, JsonValue, field_serializer, field_validator
 
@@ -42,6 +43,16 @@ class ToolSpec(BaseModel):
 
 
 ToolFunction = Callable[..., Awaitable[object]]
+type ToolInputModel = type[BaseModel]
+
+
+class ToolDecorator(Protocol):
+    """Decorador que conserva exactamente el callable de una tool."""
+
+    def __call__[TTool: ToolFunction](self, function: TTool, /) -> TTool: ...
+
+
+type ToolDecoratorResult[TTool: ToolFunction] = TTool | ToolDecorator
 
 
 @dataclass(frozen=True, slots=True)
