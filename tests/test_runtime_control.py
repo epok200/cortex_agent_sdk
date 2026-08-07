@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 
 import pytest
+from pydantic import JsonValue
 
 from cortex_agent_sdk import (
     CONTINUE,
@@ -37,7 +38,7 @@ class ScriptedEngine:
         self.closed = True
 
 
-def _call(call_id: str, name: str, **arguments: object) -> ToolCall:
+def _call(call_id: str, name: str, **arguments: JsonValue) -> ToolCall:
     return ToolCall(call_id=call_id, name=name, arguments=arguments)
 
 
