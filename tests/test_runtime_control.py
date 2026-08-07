@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import pytest
 from pydantic import JsonValue
@@ -8,12 +8,15 @@ from cortex_agent_sdk import (
     Agent,
     FinalOutput,
     PendingRun,
+    ToolApprovalContext,
     fallback_answer,
     final_answer,
     tool,
 )
 from cortex_agent_sdk.engine import EngineRequest, EngineResult, ToolCall, Usage
+from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import TextPart, ToolCallPart, ToolResultPart, Turn
+from cortex_agent_sdk.hooks import AgentHooks
 from cortex_agent_sdk.results import AgentExitReason
 from cortex_agent_sdk.runtime import AgentOptions
 from cortex_agent_sdk.sessions import MemorySessionStore
@@ -271,6 +274,145 @@ async def test_rejected_approval_never_executes_tool_and_is_visible_to_model() -
     outputs = _tool_outputs(engine.requests[1])
     assert len(outputs) == 1
     assert "conservar el evento" in outputs[0].output
+
+
+@pytest.mark.asyncio
+async def test_rejected_call_requires_new_approval_if_model_retries() -> None:
+    executions: list[str] = []
+
+    @tool(needs_approval=True)
+    async def delete_event(event_id: str) -> str:
+        executions.append(event_id)
+        return "deleted"
+
+    first = _call("call-delete-1", "delete_event", event_id="evt-1")
+    retry = _call("call-delete-2", "delete_event", event_id="evt-1")
+    engine = ScriptedEngine((_result(calls=(first,)), _result(calls=(retry,))))
+
+    async with Agent(engine, tools=(delete_event,), own_engine=False) as agent:
+        paused = await agent.run("elimina el evento")
+        assert paused.pending_run is not None
+        paused.pending_run.reject("call-delete-1")
+        retried = await agent.resume(paused.pending_run)
+
+    assert executions == []
+    assert retried.reason is AgentExitReason.APPROVAL_REQUIRED
+    assert retried.interruptions[0].call_id == "call-delete-2"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_approval_receives_validated_public_arguments() -> None:
+    seen: list[tuple[int, object, str]] = []
+    executions: list[int] = []
+
+    async def requires_review(
+        context: ToolApprovalContext,
+        arguments: Mapping[str, object],
+        call_id: str,
+    ) -> bool:
+        seen.append((context.step, arguments["count"], call_id))
+        return arguments["count"] == 5
+
+    @tool(needs_approval=requires_review)
+    async def delete_many(count: int) -> str:
+        executions.append(count)
+        return "deleted"
+
+    call = _call("call-dynamic", "delete_many", count="5")
+    engine = ScriptedEngine((_result(calls=(call,)),))
+
+    async with Agent(engine, tools=(delete_many,), own_engine=False) as agent:
+        paused = await agent.run("elimina cinco")
+
+    assert paused.reason is AgentExitReason.APPROVAL_REQUIRED
+    assert executions == []
+    assert seen == [(1, 5, "call-dynamic")]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_approval_can_allow_execution_without_pause() -> None:
+    executions: list[int] = []
+
+    def requires_review(
+        _context: ToolApprovalContext,
+        arguments: Mapping[str, object],
+        _call_id: str,
+    ) -> bool:
+        return arguments["count"] == 5
+
+    @tool(needs_approval=requires_review)
+    async def delete_many(count: int) -> str:
+        executions.append(count)
+        return "deleted"
+
+    call = _call("call-dynamic", "delete_many", count=1)
+    engine = ScriptedEngine((_result(calls=(call,)), _result(text="Listo.")))
+
+    async with Agent(engine, tools=(delete_many,), own_engine=False) as agent:
+        result = await agent.run("elimina uno")
+
+    assert result.reason is AgentExitReason.COMPLETED
+    assert executions == [1]
+
+
+@pytest.mark.asyncio
+async def test_invalid_arguments_do_not_invoke_dynamic_approval_predicate() -> None:
+    decisions: list[str] = []
+    executions: list[int] = []
+
+    def requires_review(
+        _context: ToolApprovalContext,
+        _arguments: Mapping[str, object],
+        call_id: str,
+    ) -> bool:
+        decisions.append(call_id)
+        return True
+
+    @tool(needs_approval=requires_review)
+    async def delete_many(count: int) -> str:
+        executions.append(count)
+        return "deleted"
+
+    call = _call("call-invalid", "delete_many", count="no-es-entero")
+    engine = ScriptedEngine((_result(calls=(call,)), _result(text="No pude ejecutar eso.")))
+
+    async with Agent(engine, tools=(delete_many,), own_engine=False) as agent:
+        result = await agent.run("hazlo")
+
+    assert result.reason is AgentExitReason.COMPLETED
+    assert decisions == []
+    assert executions == []
+
+
+@pytest.mark.asyncio
+async def test_approved_call_cannot_be_mutated_by_before_tool_hook() -> None:
+    executions: list[str] = []
+
+    @tool(needs_approval=True)
+    async def delete_event(event_id: str) -> str:
+        executions.append(event_id)
+        return "deleted"
+
+    async def mutate_arguments(call: ToolCall) -> ToolCall:
+        return ToolCall(
+            call_id=call.call_id,
+            name=call.name,
+            arguments={"event_id": "evt-2"},
+        )
+
+    call = _call("call-delete", "delete_event", event_id="evt-1")
+    engine = ScriptedEngine((_result(calls=(call,)),))
+    hooks = AgentHooks(before_tool=(mutate_arguments,))
+
+    async with Agent(engine, tools=(delete_event,), hooks=hooks, own_engine=False) as agent:
+        paused = await agent.run("elimina evt-1")
+        assert paused.pending_run is not None
+        paused.pending_run.approve("call-delete")
+        with pytest.raises(AppError) as caught:
+            await agent.resume(paused.pending_run)
+
+    assert caught.value.codigo is CodigoError.HOOK_FALLO
+    assert executions == []
 
 
 @pytest.mark.asyncio
