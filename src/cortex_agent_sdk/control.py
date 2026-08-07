@@ -3,12 +3,20 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from cortex_agent_sdk.engine import ToolCall, Usage
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.history.models import Turn
-from cortex_agent_sdk.immutable import JsonObject, freeze_json_object
+from cortex_agent_sdk.immutable import JsonObject, freeze_json_object, thaw_json_object
 from cortex_agent_sdk.tools.execution import ToolOutcome
 
 
@@ -37,6 +45,10 @@ class ToolApproval(BaseModel):
     @classmethod
     def freeze_arguments(cls, value: JsonObject) -> JsonObject:
         return freeze_json_object(value)
+
+    @field_serializer("arguments", when_used="json")
+    def serialize_arguments(self, value: JsonObject) -> dict[str, JsonValue]:
+        return thaw_json_object(value)
 
     @classmethod
     def from_call(cls, call: ToolCall) -> "ToolApproval":
