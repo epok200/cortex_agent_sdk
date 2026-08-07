@@ -1,4 +1,4 @@
-from typing import overload
+from typing import Protocol, cast, overload
 
 from cortex_agent_sdk.tools.models import (
     ToolDecorator,
@@ -8,19 +8,29 @@ from cortex_agent_sdk.tools.models import (
 )
 
 
+class _ToolMetadata(Protocol):
+    """Metadata interna que Cortex añade a una función decorada."""
+
+    __cortex_tool__: bool
+    __cortex_final_answer__: bool
+    __cortex_input_model__: ToolInputModel
+
+
 def _decorator(
     *,
     input_model: ToolInputModel | None,
-    final_answer: bool,
+    is_final_answer: bool,
 ) -> ToolDecorator:
     def decorate[TTool: ToolFunction](function: TTool) -> TTool:
-        setattr(function, "__cortex_tool__", True)
+        metadata = cast(_ToolMetadata, function)
 
-        if final_answer:
-            setattr(function, "__cortex_final_answer__", True)
+        metadata.__cortex_tool__ = True
+
+        if is_final_answer:
+            metadata.__cortex_final_answer__ = True
 
         if input_model is not None:
-            setattr(function, "__cortex_input_model__", input_model)
+            metadata.__cortex_input_model__ = input_model
 
         return function
 
@@ -44,7 +54,10 @@ def tool[TTool: ToolFunction](
     input_model: ToolInputModel | None = None,
 ) -> ToolDecoratorResult[TTool]:
     """Marca una tool y permite declarar un contrato Pydantic explícito."""
-    decorator = _decorator(input_model=input_model, final_answer=False)
+    decorator = _decorator(
+        input_model=input_model,
+        is_final_answer=False,
+    )
 
     if function is None:
         return decorator
@@ -69,7 +82,10 @@ def final_answer[TTool: ToolFunction](
     input_model: ToolInputModel | None = None,
 ) -> ToolDecoratorResult[TTool]:
     """Marca una tool terminal y permite un contrato Pydantic explícito."""
-    decorator = _decorator(input_model=input_model, final_answer=True)
+    decorator = _decorator(
+        input_model=input_model,
+        is_final_answer=True,
+    )
 
     if function is None:
         return decorator
