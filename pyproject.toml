@@ -74,7 +74,7 @@ markers = [
 ]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "examples"]
 pythonVersion = "3.13"
 typeCheckingMode = "standard"
 
