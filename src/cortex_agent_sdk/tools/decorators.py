@@ -25,6 +25,8 @@ def _decorator(
     result_mode: ToolResultMode,
     needs_approval: ToolApprovalRule,
 ) -> ToolDecorator:
+    """Construye el decorador interno sin alterar la firma del callable original."""
+
     def decorate[TTool: ToolFunction](function: TTool) -> TTool:
         metadata = cast(_ToolMetadata, function)
         metadata.__cortex_tool__ = True
@@ -57,7 +59,13 @@ def tool[TTool: ToolFunction](
     input_model: ToolInputModel | None = None,
     needs_approval: ToolApprovalRule = False,
 ) -> ToolDecoratorResult[TTool]:
-    """Marca una tool que devuelve su resultado al modelo y continúa el loop."""
+    """Expone una función async como tool normal de Cortex.
+
+    Un resultado exitoso vuelve al modelo y el loop puede seguir razonando o llamar más tools.
+    ``input_model`` permite usar un ``BaseModel`` como contrato explícito de entrada.
+    ``needs_approval`` puede ser ``True`` o un predicate sync/async evaluado por cada tool call.
+    El decorador conserva la firma tipada del callable original.
+    """
     decorator = _decorator(
         input_model=input_model,
         result_mode=ToolResultMode.CONTINUE,
@@ -88,7 +96,13 @@ def fallback_answer[TTool: ToolFunction](
     input_model: ToolInputModel | None = None,
     needs_approval: ToolApprovalRule = False,
 ) -> ToolDecoratorResult[TTool]:
-    """Marca una tool cuyo último resultado puede rescatar un cierre limpio sin texto."""
+    """Expone una tool cuyo resultado puede actuar como respuesta de respaldo.
+
+    La ejecución no termina el run: el resultado vuelve al modelo igual que en ``@tool``. Cortex
+    conserva el último fallback exitoso y sólo lo utiliza si el modelo termina limpiamente sin texto
+    visible. No sustituye errores, límites del runtime ni respuestas estructuradas.
+    ``input_model`` y ``needs_approval`` tienen la misma semántica que en ``@tool``.
+    """
     decorator = _decorator(
         input_model=input_model,
         result_mode=ToolResultMode.FALLBACK,
@@ -119,7 +133,12 @@ def final_answer[TTool: ToolFunction](
     input_model: ToolInputModel | None = None,
     needs_approval: ToolApprovalRule = False,
 ) -> ToolDecoratorResult[TTool]:
-    """Marca una tool cuyo resultado exitoso termina el run inmediatamente."""
+    """Expone una tool terminal cuyo ``str`` exitoso se convierte en la respuesta final.
+
+    A diferencia de ``@tool`` y ``@fallback_answer``, una ejecución exitosa corta el loop sin pedir
+    otro turno al modelo. La función debe devolver ``str``. Si requiere aprobación, Cortex pausa
+    antes de invocarla y conserva el hard stop sólo cuando la call aprobada termina correctamente.
+    """
     decorator = _decorator(
         input_model=input_model,
         result_mode=ToolResultMode.FINAL,

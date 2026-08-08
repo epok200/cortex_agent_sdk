@@ -27,7 +27,7 @@ jobs:
         run: uv sync --all-extras --group dev --python 3.13
 
       - name: Ruff
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests examples
 
       - name: Pyright
         run: uv run pyright
