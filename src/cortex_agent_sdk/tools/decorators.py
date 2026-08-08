@@ -136,8 +136,8 @@ def final_answer[TTool: ToolFunction](
     """Expone una tool terminal cuyo ``str`` exitoso se convierte en la respuesta final.
 
     A diferencia de ``@tool`` y ``@fallback_answer``, una ejecución exitosa corta el loop sin pedir
-    otro turno al modelo. La función debe devolver ``str``. Si requiere aprobación, Cortex pausa antes
-    de invocarla y conserva el hard stop únicamente cuando la call aprobada termina correctamente.
+    otro turno al modelo. La función debe devolver ``str``. Si requiere aprobación, Cortex pausa
+    antes de invocarla y conserva el hard stop sólo cuando la call aprobada termina correctamente.
     """
     decorator = _decorator(
         input_model=input_model,
