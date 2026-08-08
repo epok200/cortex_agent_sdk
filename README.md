@@ -3,7 +3,7 @@
 SDK async para construir agentes con una API pequeña y control explícito del loop, las tools, el
 historial y el ciclo de vida.
 
-> Cortex Agent SDK está en alfa. La API puede cambiar antes de la versión `0.1.0`.
+> Cortex Agent SDK está en alfa. La API puede cambiar antes de la versión `1.0.0`.
 
 ## Requisitos
 
@@ -144,10 +144,122 @@ la función una instancia ya validada. `ToolBinding(input_model=...)` ofrece la 
 tools construidas en runtime. El `ToolSpec` manual continúa disponible como escape hatch cuando el
 schema visible necesita construirse dinámicamente o requiere control de bajo nivel.
 
+### Control del resultado de tools
+
+Cortex `0.1` separa el contrato de argumentos de la semántica del resultado:
+
+- `@tool`: ejecuta y devuelve el resultado al modelo para continuar el loop.
+- `@fallback_answer`: continúa el loop, pero conserva el último resultado exitoso como respaldo si el
+  modelo termina limpiamente sin texto visible.
+- `@final_answer`: hard stop; el resultado exitoso termina el run sin volver al modelo.
+
+Un fallback permite reutilizar la misma tool de lectura tanto en una consulta simple como dentro de
+un workflow compuesto:
+
+```python
+from cortex_agent_sdk import fallback_answer
+
+
+@fallback_answer
+async def consultar_agenda(fecha: str) -> str:
+    return f"Agenda para {fecha}: ..."
+```
+
+Si el modelo llama `consultar_agenda`, después puede seguir usando otras tools. El fallback solo se
+usa cuando la terminación posterior es limpia, no hay texto visible y no existe `response_model`.
+Nunca sustituye `MAX_STEPS`, límite de fallos ni un stop incompleto del provider.
+
+### Policy post-tool
+
+Cuando terminar depende del contexto del run y no de una tool concreta, `Agent` acepta una policy
+opcional. La policy recibe los outcomes de la última tanda junto con historial, paso y `session_id` y
+decide entre continuar o terminar explícitamente:
+
+```python
+from cortex_agent_sdk import CONTINUE, Agent, FinalOutput
+
+
+def policy(context):
+    if any(outcome.output == "objetivo alcanzado" for outcome in context.outcomes):
+        return FinalOutput("Listo.")
+    return CONTINUE
+
+
+agent = Agent(engine, tools=tools, tool_result_policy=policy)
+```
+
+La policy puede ser sync o async. `@final_answer` conserva prioridad como hard stop y no es
+sustituido por la policy.
+
+### Human-in-the-loop
+
+Las acciones sensibles pueden requerir aprobación humana antes de ejecutarse:
+
+```python
+from cortex_agent_sdk import Agent, PendingRun, tool
+
+
+@tool(needs_approval=True)
+async def eliminar_evento(event_id: str) -> str:
+    return f"Eliminado {event_id}"
+
+
+result = await agent.run("Elimina el evento de mañana")
+if result.pending_run is not None:
+    pending = result.pending_run
+    pending.approve(result.interruptions[0].call_id)
+    result = await agent.resume(pending)
+```
+
+Mientras existe una interruption, la tool sensible todavía no se ha ejecutado. Un rechazo tampoco la
+ejecuta: Cortex produce un resultado de rechazo visible para el modelo y continúa el loop sin pasar
+esa call por los hooks ni por el executor. La decisión es por `call_id`; si el modelo intenta de nuevo
+la misma acción genera una nueva call y vuelve a evaluarse la regla de aprobación.
+
+La call aprobada queda ligada a su nombre y argumentos originales. Al reanudar, un `before_tool` no
+puede modificar una call ya aprobada: lo que el usuario autorizó es exactamente lo que Cortex permite
+ejecutar.
+
+`needs_approval` también puede ser un callable sync o async. Cortex valida primero los argumentos
+públicos de la tool y entrega al predicate el contexto del run, los argumentos parseados y el
+`call_id`:
+
+```python
+from collections.abc import Mapping
+
+from cortex_agent_sdk import ToolApprovalContext, tool
+
+
+def requiere_revision(
+    context: ToolApprovalContext,
+    argumentos: Mapping[str, object],
+    call_id: str,
+) -> bool:
+    return argumentos["cantidad"] > 10
+
+
+@tool(needs_approval=requiere_revision)
+async def eliminar_eventos(cantidad: int) -> str:
+    return f"Eliminados {cantidad} eventos"
+```
+
+Si los argumentos son inválidos, el predicate no se ejecuta y la llamada sigue el flujo normal de
+error de argumentos. El callable permite que una misma tool sea automática para operaciones seguras y
+requiera intervención humana sólo cuando los datos concretos de esa call lo ameritan.
+
+`PendingRun` es serializable mediante `to_json()` y recuperable con `PendingRun.from_json(...)`. Si el
+run usó tools entregadas directamente a `Agent.run(...)`, deben proporcionarse de nuevo a
+`Agent.resume(...)`. Si utilizó `response_model`, debe entregarse el mismo modelo al reanudar. Con
+sesiones persistentes, Cortex conserva el `active_turn` durante la pausa y lo cierra únicamente al
+resolver la tanda pendiente.
+
 ## Capacidades del alfa
 
-- Loop async acotado.
+- Loop async acotado y multi-tool.
 - Tools async con schema inferido, Pydantic explícito o `ToolSpec` manual.
+- Semánticas `continue`, `fallback` y `final` para resultados de tools.
+- Policy post-tool opcional.
+- Human-in-the-loop con approval estático o dinámico, pause, approve/reject, serialización y resume.
 - Historial y sesiones en memoria, Redis o PostgreSQL.
 - Hooks locales.
 - Timeouts para providers y tools.

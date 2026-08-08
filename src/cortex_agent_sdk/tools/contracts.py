@@ -2,7 +2,7 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Annotated, Any, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, cast, get_args, get_origin, get_type_hints
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -10,7 +10,14 @@ from pydantic import BaseModel, ConfigDict, JsonValue, create_model
 
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.immutable import thaw_json_object
-from cortex_agent_sdk.tools.models import Injected, ToolBinding, ToolFunction, ToolSpec
+from cortex_agent_sdk.tools.approval import ToolApprovalPredicate, ToolApprovalRule
+from cortex_agent_sdk.tools.models import (
+    Injected,
+    ToolBinding,
+    ToolFunction,
+    ToolResultMode,
+    ToolSpec,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,9 +26,18 @@ class ToolDefinition:
     function: ToolFunction
     input_model: type[BaseModel]
     private_arguments: Mapping[str, object]
-    is_final_answer: bool
+    result_mode: ToolResultMode
+    needs_approval: ToolApprovalRule
     schema_validator: Draft202012Validator | None
     input_parameter: str | None = None
+
+    @property
+    def is_final_answer(self) -> bool:
+        return self.result_mode is ToolResultMode.FINAL
+
+    @property
+    def is_fallback_answer(self) -> bool:
+        return self.result_mode is ToolResultMode.FALLBACK
 
 
 def build_definition(item: ToolFunction | ToolBinding) -> ToolDefinition:
@@ -53,16 +69,59 @@ def build_definition(item: ToolFunction | ToolBinding) -> ToolDefinition:
     spec = binding.spec or inferred_spec
     schema_validator = _explicit_validator(binding.spec, inferred_spec)
     private_arguments = MappingProxyType(dict(binding.private_arguments))
-    is_final = bool(getattr(function, "__cortex_final_answer__", False))
     return ToolDefinition(
         spec=spec,
         function=binding.function,
         input_model=input_model,
         private_arguments=private_arguments,
-        is_final_answer=is_final,
+        result_mode=_declared_result_mode(binding, function),
+        needs_approval=_declared_needs_approval(binding, function),
         schema_validator=schema_validator,
         input_parameter=input_parameter,
     )
+
+
+def _declared_result_mode(binding: ToolBinding, function: ToolFunction) -> ToolResultMode:
+    if binding.result_mode is not None:
+        if not isinstance(binding.result_mode, ToolResultMode):
+            raise AppError(CodigoError.CONFIG_INVALIDA, "result_mode inválido")
+        return binding.result_mode
+
+    decorated = getattr(binding.function, "__cortex_result_mode__", None)
+    if decorated is None:
+        decorated = getattr(function, "__cortex_result_mode__", None)
+    if decorated is not None:
+        try:
+            return ToolResultMode(decorated)
+        except ValueError as error:
+            raise AppError(CodigoError.CONFIG_INVALIDA, "result_mode inválido") from error
+
+    if bool(getattr(binding.function, "__cortex_final_answer__", False)) or bool(
+        getattr(function, "__cortex_final_answer__", False)
+    ):
+        return ToolResultMode.FINAL
+    return ToolResultMode.CONTINUE
+
+
+def _declared_needs_approval(
+    binding: ToolBinding,
+    function: ToolFunction,
+) -> ToolApprovalRule:
+    if binding.needs_approval is not None:
+        return _validate_approval_rule(binding.needs_approval)
+
+    decorated = getattr(binding.function, "__cortex_needs_approval__", None)
+    if decorated is None:
+        decorated = getattr(function, "__cortex_needs_approval__", False)
+    return _validate_approval_rule(decorated)
+
+
+def _validate_approval_rule(value: object) -> ToolApprovalRule:
+    if isinstance(value, bool):
+        return value
+    if callable(value):
+        return cast(ToolApprovalPredicate, value)
+    raise AppError(CodigoError.CONFIG_INVALIDA, "needs_approval inválido")
 
 
 def _declared_input_model(

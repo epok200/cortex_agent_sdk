@@ -1,11 +1,13 @@
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, JsonValue, field_serializer, field_validator
 
 from cortex_agent_sdk.immutable import JsonObject, freeze_json_object, thaw_json_object
+from cortex_agent_sdk.tools.approval import ToolApprovalRule
 
 
 class _InjectedMarker:
@@ -46,6 +48,14 @@ ToolFunction = Callable[..., Awaitable[object]]
 type ToolInputModel = type[BaseModel]
 
 
+class ToolResultMode(StrEnum):
+    """Semántica que el runtime aplica al resultado exitoso de una tool."""
+
+    CONTINUE = "continue"
+    FALLBACK = "fallback"
+    FINAL = "final"
+
+
 class ToolDecorator(Protocol):
     """Decorador que conserva exactamente el callable de una tool."""
 
@@ -63,6 +73,8 @@ class ToolBinding:
     spec: ToolSpec | None = None
     private_arguments: Mapping[str, object] = field(default_factory=dict)
     input_model: type[BaseModel] | None = None
+    result_mode: ToolResultMode | None = None
+    needs_approval: ToolApprovalRule | None = None
 
     def __post_init__(self) -> None:
         frozen_arguments = MappingProxyType(dict(self.private_arguments))

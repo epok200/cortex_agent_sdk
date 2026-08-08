@@ -1,6 +1,6 @@
 [project]
 name = "cortex-agent-sdk"
-version = "0.0.4"
+version = "0.1.0"
 description = "SDK async y multiproveedor para construir agentes con control explícito"
 readme = "README.md"
 license = "Apache-2.0"
