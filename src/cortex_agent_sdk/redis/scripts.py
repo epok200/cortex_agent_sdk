@@ -1,14 +1,5 @@
 ACQUIRE = """
-if redis.call('exists', KEYS[1]) == 0 then
-    local token = redis.call('incr', KEYS[2])
-    redis.call('psetex', KEYS[1], ARGV[2], ARGV[1] .. ':' .. token)
-    return token
-end
-return 0
-"""
-
-VERIFY = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
+if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
     return 1
 end
 return 0
@@ -26,7 +17,7 @@ LOAD = """
 if redis.call('get', KEYS[1]) ~= ARGV[1] then
     return {0}
 end
-local payload = redis.call('hget', KEYS[2], 'payload')
+local payload = redis.call('get', KEYS[2])
 if payload then
     redis.call('pexpire', KEYS[2], ARGV[2])
     return {1, payload}
@@ -38,12 +29,7 @@ SAVE = """
 if redis.call('get', KEYS[1]) ~= ARGV[1] then
     return 0
 end
-local current = tonumber(redis.call('hget', KEYS[2], 'version') or '0')
-if current ~= tonumber(ARGV[2]) then
-    return -1
-end
-redis.call('hset', KEYS[2], 'version', ARGV[3], 'payload', ARGV[4])
-redis.call('pexpire', KEYS[2], ARGV[5])
+redis.call('psetex', KEYS[2], ARGV[3], ARGV[2])
 return 1
 """
 
@@ -62,4 +48,3 @@ if redis.call('get', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
-

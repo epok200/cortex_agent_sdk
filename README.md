@@ -1,104 +1,150 @@
 # Cortex Agent SDK
 
-SDK async y multiproveedor para construir agentes con una API pequeña y control explícito del loop,
-las tools, el historial y el ciclo de vida.
+Cortex agrega sesiones Memory y Redis a agentes multiprovider construidos directamente con
+Pydantic AI.
+
+No implementa otro loop, otra capa de tools ni otra API de agentes. Pydantic AI conserva el control
+de providers, modelos, tools, tipado, `RunContext`, hooks, límites, approvals, outputs, usage e
+historial. Cortex sólo cubre la pieza que Pydantic AI no incluye: persistencia conversacional con un
+turno activo por sesión.
 
 > Cortex Agent SDK está en alfa. La API puede cambiar antes de la versión `1.0.0`.
 
 ## Requisitos
 
 - Python `>=3.13`.
-- Una credencial del provider elegido.
+- Pydantic AI `>=2.27,<3`, con Google y OpenAI instalados por Cortex.
 
 ## Instalación
 
-OpenAI Responses:
+Google, OpenAI y sesiones en memoria:
 
 ```bash
-uv add "cortex-agent-sdk[openai]"
+uv add cortex-agent-sdk
 ```
 
-También puede instalarse con `pip`:
+Google, OpenAI y Redis:
 
 ```bash
-python -m pip install "cortex-agent-sdk[openai]"
+uv add "cortex-agent-sdk[redis]"
 ```
 
-Extras disponibles: `openai`, `gateway`, `redis`, `postgres` y `all`.
+La instalación base incluye Google y OpenAI, además de los endpoints compatibles con OpenAI. Otros
+providers pueden agregarse desde los extras oficiales de Pydantic AI cuando un producto realmente
+los necesite. Cortex no implementa adapters paralelos.
 
-## Uso mínimo
+## Uso
 
-El SDK oficial de OpenAI lee `OPENAI_API_KEY` del entorno.
+El agente es el `Agent` nativo de Pydantic AI. El store entrega el historial bajo exclusión y lo
+guarda cuando `session.replace(...)` marca un resultado completo.
 
 ```python
 import asyncio
 
-from cortex_agent_sdk import Agent
-from cortex_agent_sdk.openai import OpenAIEngine
+from pydantic_ai import Agent
+
+from cortex_agent_sdk.sessions import MemorySessionStore
 
 
 async def main() -> None:
-    async with Agent(OpenAIEngine("gpt-5.6-luna")) as agent:
-        result = await agent.run("Responde únicamente: hola")
-    print(result.text)
+    agent = Agent("openai-responses:gpt-5.6-luna")
+    sessions = MemorySessionStore()
+
+    async with agent, sessions:
+        async with sessions.turn("usuario:42") as session:
+            result = await agent.run(
+                "Recuerda que mi color favorito es verde.",
+                message_history=session.messages,
+                conversation_id=session.session_id,
+            )
+            session.replace(result.all_messages())
+
+    print(result.output)
 
 
 asyncio.run(main())
 ```
 
-## Tools
+`replace()` es explícito por diseño:
 
-Cortex conserva tres semánticas explícitas para el resultado de una tool:
+- Si no se llama, el store no modifica el historial.
+- Si el bloque termina con una excepción, el store no guarda el reemplazo.
+- Si guardar falla, la excepción se propaga.
 
-- `@tool`: ejecuta y devuelve el resultado al modelo para continuar el loop.
-- `@fallback_answer`: continúa el loop y conserva un resultado de respaldo para un cierre limpio sin
-  texto visible.
-- `@final_answer`: un `str` exitoso termina el run sin pedir otro turno al modelo.
+## Redis
 
-Las tres variantes aceptan contratos inferidos por type hints o un `BaseModel` mediante
-`input_model=...`. También pueden declarar `needs_approval=True` o un predicate sync/async para
-human-in-the-loop por llamada.
+```python
+from cortex_agent_sdk.redis import RedisSessionStore
 
-`Agent(tool_result_policy=...)` queda como mecanismo opcional cuando la decisión de continuar o
-terminar depende del resultado de una tanda de tools y no de una tool fija.
+sessions = RedisSessionStore(
+    "redis://localhost:6379/0",
+    key_prefix="mi-producto:sesiones:v1",
+    ttl_seconds=86_400,
+)
+```
 
-## Ejemplos
+Redis mantiene un lease renovable durante todo el turno. Mientras conserva el lease, dos procesos no
+pueden usar la misma sesión al mismo tiempo y las sesiones distintas siguen siendo concurrentes. Si
+la renovación falla, Cortex interrumpe el turno propietario y no guarda como owner obsoleto. El
+historial se serializa con `ModelMessagesTypeAdapter`, el formato público de Pydantic AI.
 
-Los ejemplos ejecutables son la referencia práctica de uso:
+Al cambiar desde el runtime anterior, usa un prefix nuevo. Los formatos no son compatibles y Cortex
+no intenta convertir el historial legacy.
 
-- [`examples/minimal_openai.py`](examples/minimal_openai.py): ejecución mínima con OpenAI Responses.
-- [`examples/tool_openai.py`](examples/tool_openai.py): `@final_answer` sencillo.
-- [`examples/tool_result_control.py`](examples/tool_result_control.py): `tool`, `fallback_answer`,
-  `final_answer` y `tool_result_policy`.
-- [`examples/human_in_the_loop.py`](examples/human_in_the_loop.py): approval estático/dinámico,
-  approve/reject, serialización y `Agent.resume()`.
-- [`examples/openai_gateway.py`](examples/openai_gateway.py): endpoint compatible con OpenAI
-  Responses.
-- [`examples/list_openai_models.py`](examples/list_openai_models.py): consulta de modelos disponibles.
+## Endpoint compatible con OpenAI
 
-## Capacidades actuales
+Pydantic AI puede conectarse directamente. Para un endpoint que no debe reintentar peticiones,
+configura el provider una vez:
 
-- Loop async acotado y multi-tool.
-- Contratos de tools por type hints, Pydantic explícito o `ToolSpec` manual.
-- Modos de resultado `continue`, `fallback` y `final`.
-- Policy post-tool opcional.
-- Human-in-the-loop con approval estático o dinámico, pause, approve/reject, serialización y resume.
-- Historial y sesiones en memoria, Redis o PostgreSQL.
-- Hooks locales y timeouts para providers/tools.
-- OpenAI Responses directo o mediante un gateway compatible.
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
-Google conserva un namespace para la evolución multiproveedor, pero todavía no incluye un engine
-funcional. Anthropic y streaming permanecen fuera de este alfa.
+provider = OpenAIProvider(
+    base_url="https://example.com/v1",
+    api_key="...",
+)
+provider.client.max_retries = 0
+model = OpenAIResponsesModel("gpt-5.6-luna", provider=provider)
+agent = Agent(model)
+```
 
-## Sesiones
+El context manager de `Agent` administra el transporte del provider.
 
-Las sesiones persistentes conservan el historial por `session_id` y lo ligan al provider/modelo
-original. `MemorySessionStore`, Redis y PostgreSQL implementan el mismo contrato; Redis y PostgreSQL
-permiten compartir estado entre procesos.
+## Migración desde el runtime anterior
 
-Durante una pausa por approval, Cortex conserva el turno activo y sólo lo termina cuando las calls
-pendientes quedan resueltas. Una sesión dañada o deliberadamente descartada puede reiniciarse con
-`await agent.reset_session(session_id)`.
+| Antes | Ahora |
+|---|---|
+| `cortex_agent_sdk.Agent` | `pydantic_ai.Agent` |
+| `OpenAIEngine` | `OpenAIResponsesModel` + `OpenAIProvider` |
+| `OpenAICompatibleGateway` | `OpenAIProvider(base_url=..., api_key=...)` |
+| `OpenAIOptions` | `OpenAIResponsesModelSettings` y argumentos de `Agent.run` |
+| `@tool` e `Injected` | tools nativas + `RunContext[Deps]` |
+| `ToolBinding` | `FunctionToolset` o tools preparadas por run |
+| `AgentHooks` | `pydantic_ai.capabilities.Hooks` |
+| `turn_finished` | `Hooks(after_run=...)` |
+| `history_transform` | `Hooks(before_model_request=...)` |
+| `fallback_answer` | política local del producto sobre `AgentRunResult` |
+| `AgentOptions` | `UsageLimits`, settings del modelo y argumentos de `Agent` |
+| `AgentResult.text` | `AgentRunResult.output` |
+| `SessionStore.acquire` | `SessionStore.turn` + `Session.replace` |
+| `agent.reset_session(id)` | `store.reset(id)` |
+
+No se ofrece una capa de compatibilidad. Mantenerla volvería a duplicar la API y el runtime de
+Pydantic AI.
+
+## Superficie pública
+
+- `cortex_agent_sdk.sessions.Session`
+- `cortex_agent_sdk.sessions.SessionStore`
+- `cortex_agent_sdk.sessions.MemorySessionStore`
+- `cortex_agent_sdk.redis.RedisSessionStore`
+- `cortex_agent_sdk.errores.AppError`
+- `cortex_agent_sdk.errores.CodigoError`
+- `cortex_agent_sdk.errores.Severidad`
+
+El loop, tools, hooks, approvals, modelos y resultados se importan desde `pydantic_ai`.
 
 ## Licencia
 

@@ -1,15 +1,13 @@
 import asyncio
 
-from cortex_agent_sdk import Agent
-from cortex_agent_sdk.openai import OpenAIEngine, OpenAIOptions
+from pydantic_ai import Agent
 
 
 async def main() -> None:
-    options = OpenAIOptions(max_output_tokens=128, reasoning_effort="low")
-    async with Agent(OpenAIEngine("gpt-5.6-luna", options=options)) as agent:
+    agent = Agent("openai-responses:gpt-5.6-luna")
+    async with agent:
         result = await agent.run("Responde únicamente: hola")
-    print(result.text)
+    print(result.output)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

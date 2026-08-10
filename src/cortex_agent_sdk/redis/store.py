@@ -1,9 +1,8 @@
 import asyncio
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Self, cast
 from uuid import uuid4
@@ -13,9 +12,8 @@ from redis.exceptions import RedisError
 
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.redis import scripts
-from cortex_agent_sdk.sessions.codec import SessionCodec
-from cortex_agent_sdk.sessions.models import SessionRecord
-from cortex_agent_sdk.sessions.store import SessionLease
+from cortex_agent_sdk.sessions.codec import decode_messages, encode_messages
+from cortex_agent_sdk.sessions.models import Session
 
 type _RedisArgument = str | bytes | int | float
 
@@ -23,75 +21,18 @@ type _RedisArgument = str | bytes | int | float
 @dataclass(frozen=True, slots=True)
 class _RedisKeys:
     lease: str
-    record: str
-    fence: str
-
-
-class _RedisLease:
-    def __init__(
-        self,
-        store: "RedisSessionStore",
-        session_id: str,
-        owner: str,
-        fencing_token: int,
-    ) -> None:
-        self._store = store
-        self._session_id = session_id
-        self._owner = owner
-        self._fencing_token = fencing_token
-        self._active = True
-
-    @property
-    def session_id(self) -> str:
-        return self._session_id
-
-    @property
-    def fencing_token(self) -> int:
-        return self._fencing_token
-
-    @property
-    def renewal_interval_seconds(self) -> float:
-        return self._store.renewal_interval_seconds
-
-    async def verify_ownership(self, fencing_token: int) -> None:
-        self._ensure_active(fencing_token)
-        await self._store._verify(self._session_id, self._lease_value)
-
-    async def renew(self, fencing_token: int) -> None:
-        self._ensure_active(fencing_token)
-        await self._store._renew(self._session_id, self._lease_value)
-
-    async def load(self, fencing_token: int) -> SessionRecord | None:
-        self._ensure_active(fencing_token)
-        return await self._store._load(self._session_id, self._lease_value)
-
-    async def save(self, record: SessionRecord, fencing_token: int) -> SessionRecord:
-        self._ensure_active(fencing_token)
-        if record.session_id != self._session_id:
-            raise AppError(CodigoError.SESION_INVALIDA, "session_id no coincide con el lease")
-        return await self._store._save(record, self._lease_value)
-
-    def close(self) -> None:
-        self._active = False
-
-    @property
-    def _lease_value(self) -> str:
-        return f"{self._owner}:{self._fencing_token}"
-
-    def _ensure_active(self, fencing_token: int) -> None:
-        if not self._active or fencing_token != self._fencing_token:
-            raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
+    history: str
 
 
 class RedisSessionStore:
-    """Store persistente con lease renovable y CAS atómico en Redis."""
+    """Sesiones distribuidas con lease renovable y guardado atómico."""
 
     def __init__(
         self,
         url: str | None = None,
         *,
         client: Redis | None = None,
-        key_prefix: str = "cortex:sessions",
+        key_prefix: str = "cortex:pydantic:sessions",
         ttl_seconds: float = 86_400,
         lease_seconds: float = 30,
         retry_interval_seconds: float = 0.05,
@@ -103,22 +44,16 @@ class RedisSessionStore:
         if not key_prefix or min(durations) <= 0:
             raise AppError(CodigoError.CONFIG_INVALIDA, "configuración de Redis inválida")
 
-        if client is None:
-            self._client = Redis.from_url(cast(str, url), decode_responses=False)
-        else:
-            self._client = client
+        self._client = client or Redis.from_url(cast(str, url), decode_responses=False)
         self._owns_client = client is None
         self._key_prefix = key_prefix.rstrip(":")
         self._ttl_milliseconds = _milliseconds(ttl_seconds)
         self._lease_milliseconds = _milliseconds(lease_seconds)
         self._retry_interval_seconds = retry_interval_seconds
         self._io_timeout_seconds = io_timeout_seconds
-        self._codec = SessionCodec()
+        self._guard = asyncio.Lock()
+        self._active_turns = 0
         self._closed = False
-
-    @property
-    def renewal_interval_seconds(self) -> float:
-        return self._lease_milliseconds / 3_000
 
     async def __aenter__(self) -> Self:
         self._ensure_open()
@@ -128,57 +63,119 @@ class RedisSessionStore:
         await self.aclose()
 
     @asynccontextmanager
-    async def acquire(
+    async def turn(
         self,
         session_id: str,
-        timeout_seconds: float,
-    ) -> AsyncIterator[SessionLease]:
-        self._ensure_open()
-        if not session_id or timeout_seconds <= 0:
-            raise AppError(CodigoError.CONFIG_INVALIDA, "adquisición de sesión inválida")
-
-        owner = uuid4().hex
-        fencing_token = await self._acquire(session_id, owner, timeout_seconds)
-        lease = _RedisLease(self, session_id, owner, fencing_token)
-        try:
-            yield lease
-        finally:
-            lease.close()
-            with suppress(AppError):
-                await self._release(session_id, f"{owner}:{fencing_token}")
+        timeout_seconds: float = 5.0,
+    ) -> AsyncIterator[Session]:
+        async with self._lease(session_id, timeout_seconds) as lease:
+            payload = await self._load(session_id, lease.owner)
+            messages = decode_messages(payload) if payload is not None else []
+            session = Session(session_id, messages)
+            yield session
+            self._raise_renewal_failure(lease)
+            if session.changed:
+                await self._save(session_id, lease.owner, encode_messages(session.messages))
 
     async def reset(self, session_id: str, timeout_seconds: float = 5.0) -> None:
-        async with self.acquire(session_id, timeout_seconds) as lease:
+        async with self._lease(session_id, timeout_seconds) as lease:
             keys = self._keys(session_id)
-            result = await self._eval(
-                scripts.RESET,
-                (keys.lease, keys.record),
-                self._lease_value(lease),
-            )
+            result = await self._eval(scripts.RESET, (keys.lease, keys.history), lease.owner)
             if int(cast(int, result)) != 1:
                 raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        if self._owns_client:
-            try:
-                async with asyncio.timeout(self._io_timeout_seconds):
-                    await self._client.aclose()
-            except TimeoutError as error:
-                raise AppError(
-                    CodigoError.SESION_STORE_FALLO,
-                    "Redis no cerró su cliente dentro del timeout",
-                ) from error
-            except RedisError as error:
-                raise AppError(
-                    CodigoError.SESION_STORE_FALLO,
-                    f"Redis lanzó {type(error).__name__} al cerrar",
-                ) from error
-        self._closed = True
+        async with self._guard:
+            if self._closed:
+                return
+            if self._active_turns:
+                raise AppError(CodigoError.SESION_OCUPADA, "hay turnos de sesión activos")
+            if self._owns_client:
+                await self._close_client()
+            self._closed = True
 
-    async def _acquire(self, session_id: str, owner: str, timeout_seconds: float) -> int:
-        keys = self._keys(session_id)
+    @asynccontextmanager
+    async def _lease(
+        self,
+        session_id: str,
+        timeout_seconds: float,
+    ) -> AsyncIterator["_Lease"]:
+        self._validate_turn(session_id, timeout_seconds)
+        await self._register_turn()
+        owner = uuid4().hex
+        acquired = False
+        renewal: asyncio.Task[None] | None = None
+        body_error: BaseException | None = None
+        try:
+            await self._acquire(session_id, owner, timeout_seconds)
+            acquired = True
+            owner_task = asyncio.current_task()
+            if owner_task is None:
+                raise RuntimeError("turno sin task de asyncio")
+            renewal = asyncio.create_task(self._renew_loop(session_id, owner, owner_task))
+            try:
+                yield _Lease(owner, renewal, owner_task)
+            except asyncio.CancelledError as error:
+                renewal_failure = self._renewal_failure(renewal)
+                if renewal_failure is not None and owner_task.cancelling() == 1:
+                    owner_task.uncancel()
+                    body_error = renewal_failure
+                    raise renewal_failure from error
+                body_error = error
+                raise
+            except BaseException as error:
+                body_error = error
+                raise
+        finally:
+            cleanup = asyncio.create_task(self._cleanup_lease(session_id, owner, renewal, acquired))
+            cleanup_error = await self._wait_for_cleanup(cleanup)
+            if body_error is None and cleanup_error is not None:
+                raise cleanup_error
+
+    async def _cleanup_lease(
+        self,
+        session_id: str,
+        owner: str,
+        renewal: asyncio.Task[None] | None,
+        acquired: bool,
+    ) -> AppError | None:
+        renewal_error: AppError | None = None
+        release_error: AppError | None = None
+        try:
+            if renewal is not None:
+                renewal.cancel()
+                result = await asyncio.gather(renewal, return_exceptions=True)
+                renewal_error = next(
+                    (error for error in result if isinstance(error, AppError)),
+                    None,
+                )
+            if acquired:
+                try:
+                    await self._release(session_id, owner)
+                except AppError as error:
+                    release_error = error
+            return renewal_error or release_error
+        finally:
+            await self._unregister_turn()
+
+    async def _wait_for_cleanup(
+        self,
+        cleanup: asyncio.Task[AppError | None],
+    ) -> AppError | None:
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        if cancellation is not None:
+            if not cleanup.cancelled():
+                cleanup.exception()
+            raise cancellation
+        return cleanup.result()
+
+    async def _acquire(self, session_id: str, owner: str, timeout_seconds: float) -> None:
+        lease_key = self._keys(session_id).lease
         deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
@@ -186,42 +183,59 @@ class RedisSessionStore:
                 raise AppError(CodigoError.SESION_OCUPADA, f"sesión ocupada: {session_id}")
             result = await self._eval(
                 scripts.ACQUIRE,
-                (keys.lease, keys.fence),
+                (lease_key,),
                 owner,
                 self._lease_milliseconds,
                 timeout_seconds=remaining,
             )
-            fencing_token = int(cast(int, result))
-            if fencing_token > 0:
-                return fencing_token
+            if int(cast(int, result)) == 1:
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AppError(CodigoError.SESION_OCUPADA, f"sesión ocupada: {session_id}")
             await asyncio.sleep(min(self._retry_interval_seconds, remaining))
 
-    async def _verify(self, session_id: str, lease_value: str) -> None:
-        keys = self._keys(session_id)
-        result = await self._eval(scripts.VERIFY, (keys.lease,), lease_value)
-        if int(cast(int, result)) != 1:
-            raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
+    async def _renew_loop(
+        self,
+        session_id: str,
+        owner: str,
+        owner_task: asyncio.Task,
+    ) -> None:
+        interval = self._lease_milliseconds / 3_000
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                lease_key = self._keys(session_id).lease
+                result = await self._eval(
+                    scripts.RENEW,
+                    (lease_key,),
+                    owner,
+                    self._lease_milliseconds,
+                )
+                if int(cast(int, result)) != 1:
+                    raise AppError(
+                        CodigoError.SESION_LEASE_PERDIDO,
+                        "ownership de sesión perdido",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except AppError:
+            owner_task.cancel()
+            raise
+        except Exception as error:
+            failure = AppError(
+                CodigoError.SESION_STORE_FALLO,
+                f"renovación lanzó {type(error).__name__}",
+            )
+            owner_task.cancel()
+            raise failure from error
 
-    async def _renew(self, session_id: str, lease_value: str) -> None:
-        keys = self._keys(session_id)
-        result = await self._eval(
-            scripts.RENEW,
-            (keys.lease,),
-            lease_value,
-            self._lease_milliseconds,
-        )
-        if int(cast(int, result)) != 1:
-            raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
-
-    async def _load(self, session_id: str, lease_value: str) -> SessionRecord | None:
+    async def _load(self, session_id: str, owner: str) -> bytes | None:
         keys = self._keys(session_id)
         raw = await self._eval(
             scripts.LOAD,
-            (keys.lease, keys.record),
-            lease_value,
+            (keys.lease, keys.history),
+            owner,
             self._ttl_milliseconds,
         )
         result = cast(list[object], raw)
@@ -229,35 +243,25 @@ class RedisSessionStore:
             raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
         if len(result) == 1:
             return None
-        return self._codec.decode(cast(bytes, result[1]))
+        return cast(bytes, result[1])
 
-    async def _save(self, record: SessionRecord, lease_value: str) -> SessionRecord:
-        saved = record.model_copy(
-            update={
-                "version": record.version + 1,
-                "updated_at": datetime.now(UTC),
-            }
-        )
-        keys = self._keys(record.session_id)
+    async def _save(self, session_id: str, owner: str, payload: bytes) -> None:
+        keys = self._keys(session_id)
         result = await self._eval(
             scripts.SAVE,
-            (keys.lease, keys.record),
-            lease_value,
-            record.version,
-            saved.version,
-            self._codec.encode(saved),
+            (keys.lease, keys.history),
+            owner,
+            payload,
             self._ttl_milliseconds,
         )
-        status = int(cast(int, result))
-        if status == 1:
-            return saved
-        if status == -1:
-            raise AppError(CodigoError.SESION_CONFLICTO, "la versión de sesión cambió")
-        raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
+        if int(cast(int, result)) != 1:
+            raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
 
-    async def _release(self, session_id: str, lease_value: str) -> None:
-        keys = self._keys(session_id)
-        await self._eval(scripts.RELEASE, (keys.lease,), lease_value)
+    async def _release(self, session_id: str, owner: str) -> None:
+        lease_key = self._keys(session_id).lease
+        result = await self._eval(scripts.RELEASE, (lease_key,), owner)
+        if int(cast(int, result)) != 1:
+            raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
 
     async def _eval(
         self,
@@ -267,9 +271,9 @@ class RedisSessionStore:
         timeout_seconds: float | None = None,
     ) -> object:
         self._ensure_open()
-        timeout = timeout_seconds or self._io_timeout_seconds
+        timeout = min(timeout_seconds or self._io_timeout_seconds, self._io_timeout_seconds)
         try:
-            async with asyncio.timeout(min(timeout, self._io_timeout_seconds)):
+            async with asyncio.timeout(timeout):
                 return await self._client.eval(script, len(keys), *keys, *arguments)
         except TimeoutError as error:
             raise AppError(
@@ -282,23 +286,66 @@ class RedisSessionStore:
                 f"Redis lanzó {type(error).__name__}",
             ) from error
 
+    async def _register_turn(self) -> None:
+        async with self._guard:
+            self._ensure_open()
+            self._active_turns += 1
+
+    async def _unregister_turn(self) -> None:
+        async with self._guard:
+            self._active_turns -= 1
+
+    async def _close_client(self) -> None:
+        try:
+            async with asyncio.timeout(self._io_timeout_seconds):
+                await self._client.aclose()
+        except TimeoutError as error:
+            raise AppError(
+                CodigoError.SESION_STORE_FALLO,
+                "Redis no cerró su cliente dentro del timeout",
+            ) from error
+        except RedisError as error:
+            raise AppError(
+                CodigoError.SESION_STORE_FALLO,
+                f"Redis lanzó {type(error).__name__} al cerrar",
+            ) from error
+
     def _keys(self, session_id: str) -> _RedisKeys:
         digest = sha256(session_id.encode()).hexdigest()
         base = f"{self._key_prefix}:{{{digest}}}"
-        return _RedisKeys(
-            lease=f"{base}:lease",
-            record=f"{base}:record",
-            fence=f"{base}:fence",
-        )
+        return _RedisKeys(lease=f"{base}:lease", history=f"{base}:history")
 
-    def _lease_value(self, lease: SessionLease) -> str:
-        if not isinstance(lease, _RedisLease):
-            raise AppError(CodigoError.SESION_INVALIDA, "lease de Redis inválido")
-        return lease._lease_value
+    def _validate_turn(self, session_id: str, timeout_seconds: float) -> None:
+        if not session_id or timeout_seconds <= 0:
+            raise AppError(CodigoError.CONFIG_INVALIDA, "adquisición de sesión inválida")
+
+    def _raise_renewal_failure(self, lease: "_Lease") -> None:
+        failure = self._renewal_failure(lease.renewal)
+        if failure is not None:
+            if lease.owner_task.cancelling() != 1:
+                raise asyncio.CancelledError
+            lease.owner_task.uncancel()
+            raise failure
+
+    def _renewal_failure(self, renewal: asyncio.Task[None] | None) -> AppError | None:
+        if renewal is None or not renewal.done() or renewal.cancelled():
+            return None
+        try:
+            renewal.result()
+        except AppError as error:
+            return error
+        return None
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise AppError(CodigoError.RECURSO_CERRADO, "store Redis cerrado")
+
+
+@dataclass(frozen=True, slots=True)
+class _Lease:
+    owner: str
+    renewal: asyncio.Task[None]
+    owner_task: asyncio.Task
 
 
 def _milliseconds(seconds: float) -> int:

@@ -4,17 +4,18 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Self
 
+from pydantic_ai.messages import ModelMessage
+
 from cortex_agent_sdk.errores import AppError, CodigoError
-from cortex_agent_sdk.sessions.models import SessionRecord
-from cortex_agent_sdk.sessions.store import SessionLease
+from cortex_agent_sdk.sessions.codec import decode_messages, encode_messages
+from cortex_agent_sdk.sessions.models import Session
 
 
 @dataclass(slots=True)
 class _Entry:
-    record: SessionRecord
+    payload: bytes
     expires_at: float
 
 
@@ -24,52 +25,8 @@ class _SessionLock:
     users: int = 0
 
 
-class _MemoryLease:
-    def __init__(self, store: "MemorySessionStore", session_id: str, fencing_token: int) -> None:
-        self._store = store
-        self._session_id = session_id
-        self._fencing_token = fencing_token
-        self._active = True
-
-    @property
-    def session_id(self) -> str:
-        return self._session_id
-
-    @property
-    def fencing_token(self) -> int:
-        return self._fencing_token
-
-    @property
-    def renewal_interval_seconds(self) -> float | None:
-        return None
-
-    async def verify_ownership(self, fencing_token: int) -> None:
-        self._ensure_active(fencing_token)
-        self._store._ensure_open()
-
-    async def renew(self, fencing_token: int) -> None:
-        await self.verify_ownership(fencing_token)
-
-    async def load(self, fencing_token: int) -> SessionRecord | None:
-        await self.verify_ownership(fencing_token)
-        return await self._store._load(self._session_id)
-
-    async def save(self, record: SessionRecord, fencing_token: int) -> SessionRecord:
-        await self.verify_ownership(fencing_token)
-        if record.session_id != self._session_id:
-            raise AppError(CodigoError.SESION_INVALIDA, "session_id no coincide con el lease")
-        return await self._store._save(record)
-
-    def close(self) -> None:
-        self._active = False
-
-    def _ensure_active(self, fencing_token: int) -> None:
-        if not self._active or fencing_token != self._fencing_token:
-            raise AppError(CodigoError.SESION_LEASE_PERDIDO, "ownership de sesión perdido")
-
-
 class MemorySessionStore:
-    """Store local con exclusión por sesión, CAS, TTL y LRU."""
+    """Sesiones locales con exclusión por turno, TTL y LRU."""
 
     def __init__(self, max_sessions: int = 1_000, ttl_seconds: float = 3_600) -> None:
         if max_sessions < 1 or ttl_seconds <= 0:
@@ -80,7 +37,6 @@ class MemorySessionStore:
         self._locks: dict[str, _SessionLock] = {}
         self._guard = asyncio.Lock()
         self._closed = False
-        self._next_fencing_token = 1
 
     async def __aenter__(self) -> Self:
         self._ensure_open()
@@ -90,97 +46,87 @@ class MemorySessionStore:
         await self.aclose()
 
     @asynccontextmanager
-    async def acquire(
+    async def turn(
         self,
         session_id: str,
-        timeout_seconds: float,
-    ) -> AsyncIterator[SessionLease]:
-        self._ensure_open()
-        if not session_id or timeout_seconds <= 0:
-            raise AppError(CodigoError.CONFIG_INVALIDA, "adquisición de sesión inválida")
-
-        async with self._guard:
-            lock_entry = self._locks.setdefault(session_id, _SessionLock(asyncio.Lock()))
-            lock_entry.users += 1
-            fencing_token = self._next_fencing_token
-            self._next_fencing_token += 1
-
-        try:
-            await asyncio.wait_for(lock_entry.lock.acquire(), timeout_seconds)
-        except TimeoutError as error:
-            await self._release_lock_reference(session_id, lock_entry)
-            raise AppError(CodigoError.SESION_OCUPADA, f"sesión ocupada: {session_id}") from error
-        except BaseException:
-            await self._release_lock_reference(session_id, lock_entry)
-            raise
-
-        lease = _MemoryLease(self, session_id, fencing_token)
-        try:
-            yield lease
-        finally:
-            lease.close()
-            lock_entry.lock.release()
-            await self._release_lock_reference(session_id, lock_entry)
+        timeout_seconds: float = 5.0,
+    ) -> AsyncIterator[Session]:
+        async with self._lock(session_id, timeout_seconds):
+            session = Session(session_id, await self._load(session_id))
+            yield session
+            if session.changed:
+                await self._save(session_id, session.messages)
 
     async def reset(self, session_id: str, timeout_seconds: float = 5.0) -> None:
-        async with self.acquire(session_id, timeout_seconds), self._guard:
+        async with self._lock(session_id, timeout_seconds), self._guard:
             self._entries.pop(session_id, None)
 
     async def aclose(self) -> None:
         async with self._guard:
+            if self._closed:
+                return
+            if self._locks:
+                raise AppError(CodigoError.SESION_OCUPADA, "hay turnos de sesión activos")
             self._closed = True
             self._entries.clear()
-            self._locks.clear()
 
-    async def _load(self, session_id: str) -> SessionRecord | None:
+    async def _load(self, session_id: str) -> list[ModelMessage]:
         async with self._guard:
             self._ensure_open()
             entry = self._entries.get(session_id)
             if entry is None:
-                return None
+                return []
             if entry.expires_at <= time.monotonic():
                 del self._entries[session_id]
-                return None
+                return []
             entry.expires_at = time.monotonic() + self._ttl_seconds
             self._entries.move_to_end(session_id)
-            return entry.record
+            return decode_messages(entry.payload)
 
-    async def _save(self, record: SessionRecord) -> SessionRecord:
+    async def _save(self, session_id: str, messages: list[ModelMessage]) -> None:
+        payload = encode_messages(messages)
         async with self._guard:
             self._ensure_open()
-            current = self._entries.get(record.session_id)
-            current_version = current.record.version if current else 0
-            if current_version != record.version:
-                raise AppError(
-                    CodigoError.SESION_CONFLICTO,
-                    f"versión esperada {record.version}, vigente {current_version}",
-                )
-
-            saved = record.model_copy(
-                update={
-                    "version": record.version + 1,
-                    "updated_at": datetime.now(UTC),
-                }
-            )
             expires_at = time.monotonic() + self._ttl_seconds
-            self._entries[record.session_id] = _Entry(saved, expires_at)
-            self._entries.move_to_end(record.session_id)
+            self._entries[session_id] = _Entry(payload, expires_at)
+            self._entries.move_to_end(session_id)
             while len(self._entries) > self._max_sessions:
                 self._entries.popitem(last=False)
-            return saved
+
+    @asynccontextmanager
+    async def _lock(
+        self,
+        session_id: str,
+        timeout_seconds: float,
+    ) -> AsyncIterator[None]:
+        if not session_id or timeout_seconds <= 0:
+            raise AppError(CodigoError.CONFIG_INVALIDA, "adquisición de sesión inválida")
+        async with self._guard:
+            self._ensure_open()
+            entry = self._locks.setdefault(session_id, _SessionLock(asyncio.Lock()))
+            entry.users += 1
+
+        try:
+            await asyncio.wait_for(entry.lock.acquire(), timeout_seconds)
+        except TimeoutError as error:
+            await self._release_reference(session_id, entry)
+            raise AppError(CodigoError.SESION_OCUPADA, f"sesión ocupada: {session_id}") from error
+        except BaseException:
+            await self._release_reference(session_id, entry)
+            raise
+
+        try:
+            yield
+        finally:
+            entry.lock.release()
+            await self._release_reference(session_id, entry)
+
+    async def _release_reference(self, session_id: str, entry: _SessionLock) -> None:
+        async with self._guard:
+            entry.users -= 1
+            if self._locks.get(session_id) is entry and entry.users == 0:
+                del self._locks[session_id]
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise AppError(CodigoError.RECURSO_CERRADO, "store de sesiones cerrado")
-
-    async def _release_lock_reference(
-        self,
-        session_id: str,
-        lock_entry: _SessionLock,
-    ) -> None:
-        async with self._guard:
-            lock_entry.users -= 1
-            current = self._locks.get(session_id)
-            if current is lock_entry and lock_entry.users == 0:
-                del self._locks[session_id]
-

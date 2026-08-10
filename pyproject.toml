@@ -1,12 +1,12 @@
 [project]
 name = "cortex-agent-sdk"
-version = "0.1.0"
-description = "SDK async y multiproveedor para construir agentes con control explícito"
+version = "0.2.1"
+description = "Sesiones Memory y Redis para agentes multiprovider con Pydantic AI"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.13"
 authors = [{ name = "EPOK" }]
-keywords = ["agents", "asyncio", "openai", "sdk"]
+keywords = ["agents", "pydantic-ai", "redis", "sessions"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -17,8 +17,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "jsonschema>=4.25,<5",
-    "pydantic>=2.13,<3",
+    "pydantic-ai-slim[google,openai]>=2.27,<3",
 ]
 
 [project.urls]
@@ -26,28 +25,16 @@ Repository = "https://github.com/epok200/cortex_agent_sdk"
 Issues = "https://github.com/epok200/cortex_agent_sdk/issues"
 
 [project.optional-dependencies]
-openai = [
-    "openai>=2.52,<3",
-]
-gateway = [
-    "openai>=2.52,<3",
-]
+openai = []
 all = [
-    "asyncpg>=0.31.0",
-    "openai>=2.52,<3",
     "redis>=8.1.0",
 ]
 redis = [
     "redis>=8.1.0",
 ]
-postgres = [
-    "asyncpg>=0.31.0",
-]
 
 [dependency-groups]
 dev = [
-    "asyncpg>=0.31.0",
-    "openai>=2.52,<3",
     "pyright>=1.1.408",
     "pytest>=9.0",
     "pytest-asyncio>=1.3",
