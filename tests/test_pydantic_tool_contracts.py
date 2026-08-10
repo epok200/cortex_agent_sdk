@@ -3,6 +3,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from importlib.metadata import requires, version
+from types import SimpleNamespace
 
 import pytest
 from pydantic_ai import Agent, RunContext
@@ -17,6 +18,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+import cortex_agent_sdk.sessions.memory as memory_module
 from cortex_agent_sdk.errores import AppError, CodigoError
 from cortex_agent_sdk.sessions import MemorySessionStore, Session, SessionStore
 from cortex_agent_sdk.sessions.codec import decode_messages, encode_messages
@@ -200,6 +202,139 @@ async def test_memory_aplica_ttl_lru_y_reset() -> None:
     await asyncio.sleep(0.03)
     async with store.turn("s3") as session:
         assert not session.messages
+
+
+async def test_memory_lru_no_expulsa_turno_activo() -> None:
+    store = MemorySessionStore(max_sessions=1)
+
+    with pytest.raises(RuntimeError, match="caída simulada"):
+        async with store.turn("efecto") as active_session:
+            await active_session.start_tool_turn(
+                [ToolCallPart("crear", {}, "call-1")]
+            )
+            async with store.turn("lectura") as other_session:
+                other_session.replace([_message("otra sesión")])
+            raise RuntimeError("caída simulada")
+
+    with pytest.raises(AppError) as captured:
+        async with store.turn("efecto"):
+            pass
+
+    assert captured.value.codigo is CodigoError.SESION_RECUPERACION_REQUERIDA
+
+
+async def test_memory_lru_no_expulsa_sesion_adquirida() -> None:
+    store = MemorySessionStore(max_sessions=1)
+    history = _message("historial de A")
+
+    async with store.turn("sesion-a") as session:
+        session.replace([history])
+
+    async with store.turn("sesion-a"), store.turn("sesion-b") as session_b:
+        session_b.replace([_message("historial de B")])
+
+    async with store.turn("sesion-a") as session:
+        assert session.messages == [history]
+
+
+async def test_memory_lru_no_autoexpulsa_checkpoint_actual() -> None:
+    store = MemorySessionStore(max_sessions=1)
+    checkpoint = ModelRequest(
+        parts=[ToolReturnPart("crear", "efecto confirmado", "call-b")]
+    )
+
+    with pytest.raises(RuntimeError, match="caída posterior"):
+        async with store.turn("sesion-a") as session_a:
+            await session_a.start_tool_turn(
+                [ToolCallPart("crear", {}, "call-a")]
+            )
+            async with store.turn("sesion-b") as session_b:
+                await session_b.start_tool_turn(
+                    [ToolCallPart("crear", {}, "call-b")]
+                )
+                await session_b.checkpoint([checkpoint])
+                raise RuntimeError("caída posterior")
+
+    async with store.turn("sesion-b") as session_b:
+        assert session_b.messages == [checkpoint]
+
+    with pytest.raises(AppError) as captured:
+        async with store.turn("sesion-a"):
+            pass
+
+    assert captured.value.codigo is CodigoError.SESION_RECUPERACION_REQUERIDA
+
+
+async def test_memory_lru_purga_marcadores_expirados(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0])
+    monkeypatch.setattr(memory_module, "time", fake_time)
+    store = MemorySessionStore(max_sessions=1, ttl_seconds=1)
+
+    for index in range(5):
+        async with store.turn(f"sesion-{index}") as session:
+            await session.start_tool_turn(
+                [ToolCallPart("crear", {}, f"call-{index}")]
+            )
+        clock[0] += 2
+
+    assert list(store._entries) == ["sesion-4"]
+
+
+async def test_memory_mantiene_marcador_durante_tool_larga(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0])
+    monkeypatch.setattr(memory_module, "time", fake_time)
+    store = MemorySessionStore(max_sessions=1, ttl_seconds=1)
+
+    with pytest.raises(RuntimeError, match="caída tardía"):
+        async with store.turn("chat") as session:
+            await session.start_tool_turn(
+                [ToolCallPart("crear", {}, "call-1")]
+            )
+            clock[0] = 5
+            async with store.turn("otra") as other:
+                other.replace([_message("otra sesión")])
+            raise RuntimeError("caída tardía")
+
+    with pytest.raises(AppError) as captured:
+        async with store.turn("chat"):
+            pass
+    assert captured.value.codigo is CodigoError.SESION_RECUPERACION_REQUERIDA
+
+    clock[0] = 7
+    async with store.turn("chat") as session:
+        assert not session.messages
+
+
+async def test_memory_session_no_persiste_fuera_de_su_turno() -> None:
+    store = MemorySessionStore()
+    current = _message("historial actual")
+    stale = _message("historial obsoleto")
+
+    async with store.turn("chat") as old_session:
+        captured_checkpoint = old_session._save_checkpoint
+
+    assert captured_checkpoint is not None
+    async with store.turn("chat") as new_session:
+        new_session.replace([current])
+
+    with pytest.raises(AppError) as checkpoint_error:
+        await old_session.checkpoint([stale])
+    with pytest.raises(AppError) as tool_error:
+        await old_session.start_tool_turn([ToolCallPart("crear", {}, "call-old")])
+    with pytest.raises(AppError) as owner_error:
+        await captured_checkpoint([stale])
+
+    assert checkpoint_error.value.codigo is CodigoError.CONFIG_INVALIDA
+    assert tool_error.value.codigo is CodigoError.CONFIG_INVALIDA
+    assert owner_error.value.codigo is CodigoError.SESION_INVALIDA
+    async with store.turn("chat") as session:
+        assert session.messages == [current]
 
 
 async def test_memory_no_cierra_con_turnos_activos() -> None:

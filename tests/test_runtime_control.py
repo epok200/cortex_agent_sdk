@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
 from redis.asyncio import Redis
 
 from cortex_agent_sdk.errores import AppError, CodigoError
@@ -37,7 +37,12 @@ class _FakeRedis:
         if script == scripts.ACQUIRE:
             return self._acquire(keys[0], cast(str, arguments[0]), cast(int, arguments[1]))
         if script == scripts.RENEW:
-            return self._renew(keys[0], cast(str, arguments[0]), cast(int, arguments[1]))
+            return self._renew(
+                keys,
+                cast(str, arguments[0]),
+                cast(int, arguments[1]),
+                cast(int, arguments[2]),
+            )
         if script == scripts.LOAD:
             return self._load(keys, cast(str, arguments[0]), cast(int, arguments[1]))
         if script == scripts.SAVE:
@@ -47,10 +52,24 @@ class _FakeRedis:
                 cast(bytes, arguments[1]),
                 cast(int, arguments[2]),
             )
+        if script == scripts.MARK_ACTIVE:
+            return self._mark_active(
+                keys,
+                cast(str, arguments[0]),
+                cast(bytes, arguments[1]),
+                cast(int, arguments[2]),
+            )
+        if script == scripts.CHECKPOINT:
+            return self._checkpoint(
+                keys,
+                cast(str, arguments[0]),
+                cast(bytes, arguments[1]),
+                cast(int, arguments[2]),
+            )
         if script == scripts.RESET:
             return self._reset(keys, cast(str, arguments[0]))
         if script == scripts.RELEASE:
-            return self._release(keys[0], cast(str, arguments[0]))
+            return self._release(keys, cast(str, arguments[0]), cast(int, arguments[1]))
         raise AssertionError("script desconocido")
 
     async def aclose(self) -> None:
@@ -67,20 +86,31 @@ class _FakeRedis:
         self._set(key, owner, ttl)
         return 1
 
-    def _renew(self, key: str, owner: str, ttl: int) -> int:
-        if self.reject_renewals or self._get(key) != owner:
+    def _renew(
+        self,
+        keys: tuple[str, ...],
+        owner: str,
+        lease_ttl: int,
+        session_ttl: int,
+    ) -> int:
+        if self.reject_renewals or self._get(keys[0]) != owner:
             return 0
-        self._set(key, owner, ttl)
+        self._set(keys[0], owner, lease_ttl)
+        active = self._get(keys[1])
+        if active is not None:
+            self._set(keys[1], active, session_ttl)
         return 1
 
     def _load(self, keys: tuple[str, ...], owner: str, ttl: int) -> list[object]:
         if self._get(keys[0]) != owner:
             return [0]
         payload = self._get(keys[1])
-        if payload is None:
-            return [1]
-        self._set(keys[1], payload, ttl)
-        return [1, payload]
+        active = self._get(keys[2])
+        if payload is not None:
+            self._set(keys[1], payload, ttl)
+        if active is not None:
+            self._set(keys[2], active, ttl)
+        return [1, payload, active]
 
     def _save(self, keys: tuple[str, ...], owner: str, payload: bytes, ttl: int) -> int:
         if self._get(keys[0]) != owner:
@@ -88,16 +118,47 @@ class _FakeRedis:
         self._set(keys[1], payload, ttl)
         return 1
 
+    def _mark_active(
+        self,
+        keys: tuple[str, ...],
+        owner: str,
+        payload: bytes,
+        ttl: int,
+    ) -> int:
+        if self._get(keys[0]) != owner:
+            return 0
+        if self._get(keys[1]) is not None:
+            return -1
+        self._set(keys[1], payload, ttl)
+        return 1
+
+    def _checkpoint(
+        self,
+        keys: tuple[str, ...],
+        owner: str,
+        payload: bytes,
+        ttl: int,
+    ) -> int:
+        if self._get(keys[0]) != owner:
+            return 0
+        self._set(keys[1], payload, ttl)
+        self.values.pop(keys[2], None)
+        return 1
+
     def _reset(self, keys: tuple[str, ...], owner: str) -> int:
         if self._get(keys[0]) != owner:
             return 0
         self.values.pop(keys[1], None)
+        self.values.pop(keys[2], None)
         return 1
 
-    def _release(self, key: str, owner: str) -> int:
-        if self.reject_releases or self._get(key) != owner:
+    def _release(self, keys: tuple[str, ...], owner: str, session_ttl: int) -> int:
+        if self.reject_releases or self._get(keys[0]) != owner:
             return 0
-        self.values.pop(key, None)
+        active = self._get(keys[1])
+        if active is not None:
+            self._set(keys[1], active, session_ttl)
+        self.values.pop(keys[0], None)
         return 1
 
     def _get(self, key: str) -> str | bytes | None:
@@ -181,10 +242,12 @@ def _store(
     *,
     prefix: str = "test:sessions",
     lease_seconds: float = 0.03,
+    ttl_seconds: float = 86_400,
 ) -> RedisSessionStore:
     return RedisSessionStore(
         client=cast(Redis, client),
         key_prefix=prefix,
+        ttl_seconds=ttl_seconds,
         lease_seconds=lease_seconds,
         retry_interval_seconds=0.002,
         io_timeout_seconds=0.1,
@@ -209,6 +272,89 @@ async def test_redis_persiste_resetea_y_no_cierra_cliente_inyectado() -> None:
     await first.aclose()
     await second.aclose()
     assert not client.closed
+
+
+async def test_redis_checkpoint_guarda_historial_y_limpia_turno_activo() -> None:
+    client = _FakeRedis()
+    store = _store(client)
+    message = ModelRequest(parts=[UserPromptPart("confirmado")])
+
+    async with store.turn("chat") as session:
+        await session.start_tool_turn([ToolCallPart("crear", {}, "call-1")])
+        await session.checkpoint([message])
+
+    async with store.turn("chat") as session:
+        assert session.messages == [message]
+
+
+async def test_redis_session_no_persiste_fuera_de_su_turno() -> None:
+    client = _FakeRedis()
+    store = _store(client)
+    current = ModelRequest(parts=[UserPromptPart("historial actual")])
+    stale = ModelRequest(parts=[UserPromptPart("historial obsoleto")])
+
+    async with store.turn("chat") as old_session:
+        pass
+    async with store.turn("chat") as new_session:
+        new_session.replace([current])
+
+    with pytest.raises(AppError) as checkpoint_error:
+        await old_session.checkpoint([stale])
+    with pytest.raises(AppError) as tool_error:
+        await old_session.start_tool_turn([ToolCallPart("crear", {}, "call-old")])
+
+    assert checkpoint_error.value.codigo is CodigoError.CONFIG_INVALIDA
+    assert tool_error.value.codigo is CodigoError.CONFIG_INVALIDA
+    async with store.turn("chat") as session:
+        assert session.messages == [current]
+
+
+async def test_redis_bloquea_turno_activo_vigente_y_reset_lo_libera() -> None:
+    client = _FakeRedis()
+    store = _store(client)
+
+    with pytest.raises(RuntimeError, match="caída simulada"):
+        async with store.turn("chat") as session:
+            await session.start_tool_turn(
+                [ToolCallPart("crear", {"secreto": "no persistir"}, "call-1")]
+            )
+            raise RuntimeError("caída simulada")
+
+    active_payloads = [
+        value.content
+        for key, value in client.values.items()
+        if key.endswith(":active")
+    ]
+    assert active_payloads == [b'{"calls":[["crear","call-1"]]}']
+
+    with pytest.raises(AppError) as captured:
+        async with store.turn("chat"):
+            pass
+
+    assert captured.value.codigo is CodigoError.SESION_RECUPERACION_REQUERIDA
+
+    await store.reset("chat")
+    async with store.turn("chat") as session:
+        assert not session.messages
+
+
+async def test_redis_mantiene_marcador_durante_tool_larga() -> None:
+    client = _FakeRedis()
+    store = _store(client, lease_seconds=0.015, ttl_seconds=0.02)
+
+    with pytest.raises(RuntimeError, match="caída tardía"):
+        async with store.turn("chat") as session:
+            await session.start_tool_turn(
+                [ToolCallPart("crear", {}, "call-1")]
+            )
+            await asyncio.sleep(0.06)
+            raise RuntimeError("caída tardía")
+
+    with pytest.raises(AppError) as captured:
+        async with store.turn("chat"):
+            pass
+
+    assert captured.value.codigo is CodigoError.SESION_RECUPERACION_REQUERIDA
 
 
 async def test_redis_renueva_el_lease_durante_el_turno() -> None:

@@ -75,6 +75,7 @@ asyncio.run(main())
 
 - Si no se llama, el store no modifica el historial.
 - Si el bloque termina con una excepción, el store no guarda el reemplazo.
+- Los checkpoints confirmados dentro del turno permanecen aunque una operación posterior falle.
 - Si guardar falla, la excepción se propaga.
 
 ## Redis
@@ -96,6 +97,47 @@ historial se serializa con `ModelMessagesTypeAdapter`, el formato público de Py
 
 Al cambiar desde el runtime anterior, usa un prefix nuevo. Los formatos no son compatibles y Cortex
 no intenta convertir el historial legacy.
+
+## Checkpoints de tools
+
+`session_checkpoints` guarda el `ToolReturn` canónico al terminar cada `CallToolsNode`, antes de la
+siguiente petición al modelo. Las tools con efectos se declaran por nombre para marcar el turno antes
+de ejecutarlas:
+
+```python
+from cortex_agent_sdk.capabilities import session_checkpoints
+
+async with sessions.turn("usuario:42") as session:
+    result = await agent.run(
+        "Agenda la cita.",
+        message_history=session.messages,
+        conversation_id=session.session_id,
+        capabilities=[
+            session_checkpoints(
+                session,
+                effect_tools={"crear_evento", "mover_evento"},
+            )
+        ],
+    )
+    session.replace(result.all_messages())
+```
+
+El marcador activo contiene únicamente nombre e ID de cada tool, nunca argumentos. Memory lo cambia
+bajo su lock y Redis guarda el historial y elimina el marcador en una sola operación Lua. Si el
+proceso se interrumpe después de comenzar un efecto y antes del checkpoint, el siguiente `turn()`
+falla con `SESION_RECUPERACION_REQUERIDA` mientras el marcador siga vigente. Cada intento renueva su
+TTL y, sin intentos, expira junto con la sesión al cumplir `ttl_seconds`.
+
+Este marcador es un latch fail-closed, no una API de reconciliación. El consumidor debe comprobar o
+reconciliar el efecto por sus propios medios y después llamar `reset()`. Cortex no conserva los
+argumentos de la tool, no determina si la escritura externa ocurrió y no automatiza la recuperación.
+El latch sólo se elimina cuando todas las tools de efecto marcadas devuelven un `ToolReturn` exitoso;
+fallos, retries, denegaciones, interrupciones o resultados ausentes conservan el bloqueo.
+
+Todos los procesos que comparten `key_prefix` deben entender el marcador `:active`. La versión
+`0.3.1` lo ignora, por lo que no debe convivir mediante rolling deploy ni rollback con una versión
+que use checkpoints bajo el mismo prefix. La migración requiere un namespace nuevo y un corte
+coordinado de procesos.
 
 ## Endpoint compatible con OpenAI
 
@@ -135,7 +177,10 @@ agent = Agent(
 ```
 
 La aplicación conserva la decisión sobre las tools elegibles. La capacidad no usa resultados
-fallidos, vacíos ni pertenecientes a otro run, y no reemplaza texto o nuevas llamadas del modelo.
+fallidos, vacíos ni pertenecientes a otro run, y no reemplaza texto o nuevas llamadas del modelo. Si
+la petición al provider falla después de un resultado elegible, devuelve ese resultado verificado,
+siempre que el run no contenga fallos ni retries de tools. Sin un resultado elegible y limpio,
+propaga intacta la excepción del provider. Los errores de tools no pasan por este fallback.
 
 ## Migración desde el runtime anterior
 
@@ -166,6 +211,7 @@ Pydantic AI.
 - `cortex_agent_sdk.sessions.MemorySessionStore`
 - `cortex_agent_sdk.redis.RedisSessionStore`
 - `cortex_agent_sdk.capabilities.last_tool_result_fallback`
+- `cortex_agent_sdk.capabilities.session_checkpoints`
 - `cortex_agent_sdk.errores.AppError`
 - `cortex_agent_sdk.errores.CodigoError`
 - `cortex_agent_sdk.errores.Severidad`
