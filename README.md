@@ -13,30 +13,36 @@ opcionales construidas sobre sus hooks públicos.
 ## Requisitos
 
 - Python `>=3.13`.
-- Pydantic AI `>=2.27,<3`, con Google y OpenAI instalados por Cortex.
+- Pydantic AI `>=2.27,<3`.
 
 ## Instalación
 
-Google, OpenAI y sesiones en memoria:
+Solo sesiones en memoria y capabilities:
 
 ```bash
 uv add cortex-agent-sdk
 ```
 
-Google, OpenAI y Redis:
+OpenAI y sesiones en memoria:
 
 ```bash
-uv add "cortex-agent-sdk[redis]"
+uv add "cortex-agent-sdk[openai]"
 ```
 
-La instalación base incluye Google y OpenAI, además de los endpoints compatibles con OpenAI. Otros
-providers pueden agregarse desde los extras oficiales de Pydantic AI cuando un producto realmente
-los necesite. Cortex no implementa adapters paralelos.
+OpenAI y Redis:
+
+```bash
+uv add "cortex-agent-sdk[openai,redis]"
+```
+
+Google se instala con el extra `google`. Cada producto elige únicamente sus providers. Cortex no
+implementa adapters paralelos ni ofrece un extra que los instale todos.
 
 ## Uso
 
 El agente es el `Agent` nativo de Pydantic AI. El store entrega el historial bajo exclusión y lo
 guarda cuando `session.replace(...)` marca un resultado completo.
+El siguiente ejemplo requiere el extra `openai`.
 
 ```python
 import asyncio

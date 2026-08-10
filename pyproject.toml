@@ -1,6 +1,6 @@
 [project]
 name = "cortex-agent-sdk"
-version = "0.3.0"
+version = "0.3.1"
 description = "Sesiones y capacidades puntuales para agentes multiprovider con Pydantic AI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "pydantic-ai-slim[google,openai]>=2.27,<3",
+    "pydantic-ai-slim>=2.27,<3",
 ]
 
 [project.urls]
@@ -25,7 +25,12 @@ Repository = "https://github.com/epok200/cortex_agent_sdk"
 Issues = "https://github.com/epok200/cortex_agent_sdk/issues"
 
 [project.optional-dependencies]
-openai = []
+google = [
+    "pydantic-ai-slim[google]>=2.27,<3",
+]
+openai = [
+    "pydantic-ai-slim[openai]>=2.27,<3",
+]
 redis = [
     "redis>=8.1.0",
 ]

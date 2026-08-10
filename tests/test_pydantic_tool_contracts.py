@@ -2,7 +2,7 @@ import asyncio
 import subprocess
 import sys
 from dataclasses import dataclass
-from importlib.metadata import version
+from importlib.metadata import requires, version
 
 import pytest
 from pydantic_ai import Agent, RunContext
@@ -54,6 +54,17 @@ def test_version_publica_coincide_con_metadata() -> None:
     import cortex_agent_sdk
 
     assert cortex_agent_sdk.__version__ == version("cortex-agent-sdk")
+
+
+def test_dependencia_base_no_instala_providers() -> None:
+    requirements = requires("cortex-agent-sdk") or []
+    base = [
+        item
+        for item in requirements
+        if item.startswith("pydantic-ai-slim") and ";" not in item
+    ]
+
+    assert base == ["pydantic-ai-slim<3,>=2.27"]
 
 
 def test_session_replace_copia_el_historial() -> None:
