@@ -1,12 +1,12 @@
 # Cortex Agent SDK
 
-Cortex agrega sesiones Memory y Redis a agentes multiprovider construidos directamente con
-Pydantic AI.
+Cortex agrega sesiones Memory y Redis, junto con capacidades puntuales que Pydantic AI no incluye,
+a agentes multiprovider construidos directamente con Pydantic AI.
 
 No implementa otro loop, otra capa de tools ni otra API de agentes. Pydantic AI conserva el control
 de providers, modelos, tools, tipado, `RunContext`, hooks, límites, approvals, outputs, usage e
-historial. Cortex sólo cubre la pieza que Pydantic AI no incluye: persistencia conversacional con un
-turno activo por sesión.
+historial. Cortex aporta persistencia conversacional con un turno activo por sesión y capacidades
+opcionales construidas sobre sus hooks públicos.
 
 > Cortex Agent SDK está en alfa. La API puede cambiar antes de la versión `1.0.0`.
 
@@ -112,6 +112,25 @@ agent = Agent(model)
 
 El context manager de `Agent` administra el transporte del provider.
 
+## Fallback del resultado de una tool
+
+Pydantic AI reintenta cuando un modelo termina sin texto. Para tools cuyo resultado ya es una
+respuesta completa, Cortex puede reutilizar el último resultado exitoso del mismo run:
+
+```python
+from pydantic_ai import Agent
+
+from cortex_agent_sdk.capabilities import last_tool_result_fallback
+
+agent = Agent(
+    "openai-responses:gpt-5.6-luna",
+    capabilities=[last_tool_result_fallback({"confirmar_agenda"})],
+)
+```
+
+La aplicación conserva la decisión sobre las tools elegibles. La capacidad no usa resultados
+fallidos, vacíos ni pertenecientes a otro run, y no reemplaza texto o nuevas llamadas del modelo.
+
 ## Migración desde el runtime anterior
 
 | Antes | Ahora |
@@ -125,7 +144,7 @@ El context manager de `Agent` administra el transporte del provider.
 | `AgentHooks` | `pydantic_ai.capabilities.Hooks` |
 | `turn_finished` | `Hooks(after_run=...)` |
 | `history_transform` | `Hooks(before_model_request=...)` |
-| `fallback_answer` | política local del producto sobre `AgentRunResult` |
+| `fallback_answer` | `last_tool_result_fallback(...)` opcional |
 | `AgentOptions` | `UsageLimits`, settings del modelo y argumentos de `Agent` |
 | `AgentResult.text` | `AgentRunResult.output` |
 | `SessionStore.acquire` | `SessionStore.turn` + `Session.replace` |
@@ -140,6 +159,7 @@ Pydantic AI.
 - `cortex_agent_sdk.sessions.SessionStore`
 - `cortex_agent_sdk.sessions.MemorySessionStore`
 - `cortex_agent_sdk.redis.RedisSessionStore`
+- `cortex_agent_sdk.capabilities.last_tool_result_fallback`
 - `cortex_agent_sdk.errores.AppError`
 - `cortex_agent_sdk.errores.CodigoError`
 - `cortex_agent_sdk.errores.Severidad`

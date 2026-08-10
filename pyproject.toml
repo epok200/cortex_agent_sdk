@@ -1,7 +1,7 @@
 [project]
 name = "cortex-agent-sdk"
-version = "0.2.1"
-description = "Sesiones Memory y Redis para agentes multiprovider con Pydantic AI"
+version = "0.3.0"
+description = "Sesiones y capacidades puntuales para agentes multiprovider con Pydantic AI"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.13"
@@ -26,9 +26,6 @@ Issues = "https://github.com/epok200/cortex_agent_sdk/issues"
 
 [project.optional-dependencies]
 openai = []
-all = [
-    "redis>=8.1.0",
-]
 redis = [
     "redis>=8.1.0",
 ]

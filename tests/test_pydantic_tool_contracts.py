@@ -41,7 +41,7 @@ def test_import_raiz_no_carga_providers_ni_stores_opcionales() -> None:
     subprocess.run([sys.executable, "-c", command], check=True)
 
 
-def test_api_publica_expone_solo_piezas_de_sesion() -> None:
+def test_api_raiz_no_expone_runtime_pydantic() -> None:
     import cortex_agent_sdk
 
     assert not hasattr(cortex_agent_sdk, "Agent")

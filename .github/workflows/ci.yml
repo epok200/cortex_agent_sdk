@@ -24,7 +24,7 @@ jobs:
         run: uv python install 3.13
 
       - name: Sync
-        run: uv sync --all-extras --group dev --python 3.13
+        run: uv sync --extra redis --group dev --python 3.13
 
       - name: Ruff
         run: uv run ruff check src tests examples
